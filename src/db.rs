@@ -83,6 +83,11 @@ pub fn init_database() -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_entries_parent
         ON entries(parent);
+
+        CREATE TABLE IF NOT EXISTS applied_tx (
+            txid INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        );
         ",
     )?;
 
@@ -249,6 +254,56 @@ pub fn delete_entry_metadata(ino: u64) -> Result<()> {
         "DELETE FROM entries WHERE ino = ?1",
         rusqlite::params![ino as i64],
     )?;
+
+    Ok(())
+}
+
+pub fn is_transaction_applied(txid: u64) -> Result<bool> {
+    let conn = Connection::open("volume/metadata.db")?;
+
+    let exists: i64 = conn.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM applied_tx
+            WHERE txid = ?1
+        )
+        ",
+        rusqlite::params![txid as i64],
+        |row| row.get(0),
+    )?;
+
+    Ok(exists != 0)
+}
+
+pub fn mark_transaction_applied(txid: u64) -> Result<()> {
+    let conn = Connection::open("volume/metadata.db")?;
+
+    conn.execute(
+        "
+        INSERT OR IGNORE INTO applied_tx
+            (txid, applied_at)
+        VALUES
+            (?1, ?2)
+        ",
+        rusqlite::params![txid as i64, now_timestamp(),],
+    )?;
+
+    Ok(())
+}
+
+pub fn applied_transaction_count() -> Result<u64> {
+    let conn = Connection::open("volume/metadata.db")?;
+
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM applied_tx", [], |row| row.get(0))?;
+
+    Ok(count as u64)
+}
+
+pub fn clear_applied_transactions() -> Result<()> {
+    let conn = Connection::open("volume/metadata.db")?;
+
+    conn.execute("DELETE FROM applied_tx", [])?;
 
     Ok(())
 }
