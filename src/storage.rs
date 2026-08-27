@@ -21,3 +21,12 @@ pub fn load_file_data(ino: u64) -> io::Result<Vec<u8>> {
 
     fs::read(path)
 }
+pub fn delete_file_data(ino: u64) -> io::Result<()> {
+    let path = block_path(ino);
+
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+
+    Ok(())
+}

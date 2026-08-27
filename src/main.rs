@@ -1,5 +1,6 @@
 mod db;
 mod storage;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::sync::Mutex;
@@ -10,6 +11,7 @@ use fuser::{
     Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
+
 const TTL: Duration = Duration::from_secs(1);
 
 struct MemoryFile {
@@ -152,6 +154,7 @@ impl Filesystem for Ccfs {
             reply.error(Errno::ENOENT);
         }
     }
+
     fn setattr(
         &self,
         _req: &Request,
@@ -188,6 +191,12 @@ impl Filesystem for Ccfs {
 
         if let Some(size) = size {
             file.data.resize(size as usize, 0);
+
+            if let Err(err) = storage::save_file_data(u64::from(file.ino), &file.data) {
+                eprintln!("Failed to persist resized file data: {}", err);
+                reply.error(Errno::EIO);
+                return;
+            }
         }
 
         if let Err(err) = db::save_file_metadata(
@@ -203,6 +212,7 @@ impl Filesystem for Ccfs {
 
         reply.attr(&TTL, &file_attr(file));
     }
+
     fn readdir(
         &self,
         _req: &Request,
@@ -291,6 +301,44 @@ impl Filesystem for Ccfs {
         );
     }
 
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if parent != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        let name = name.to_string_lossy().into_owned();
+
+        // hello.txt is a built-in demo file created on every startup.
+        if name == "hello.txt" {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+
+        let Some(ino) = state.files.get(&name).map(|file| file.ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if let Err(err) = storage::delete_file_data(u64::from(ino)) {
+            eprintln!("Failed to delete file data: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        if let Err(err) = db::delete_file_metadata(u64::from(ino)) {
+            eprintln!("Failed to delete file metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        state.files.remove(&name);
+
+        reply.ok();
+    }
+
     fn read(
         &self,
         _req: &Request,
@@ -352,6 +400,7 @@ impl Filesystem for Ccfs {
         }
 
         file.data[start..end].copy_from_slice(data);
+
         if let Err(err) = storage::save_file_data(u64::from(file.ino), &file.data) {
             eprintln!("Failed to persist file data: {}", err);
             reply.error(Errno::EIO);
@@ -368,6 +417,7 @@ impl Filesystem for Ccfs {
             reply.error(Errno::EIO);
             return;
         }
+
         reply.written(data.len() as u32);
     }
 
@@ -398,6 +448,7 @@ fn main() {
     let _db = db::init_database().expect("Failed to initialize SQLite database");
 
     println!("SQLite metadata database ready.");
+
     let mountpoint = "mount";
 
     let mut config = Config::default();
