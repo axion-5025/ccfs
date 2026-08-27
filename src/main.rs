@@ -25,6 +25,7 @@ const NAME_MAX: usize = 255;
 
 const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
 const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
+const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -84,6 +85,19 @@ struct WriteJournalPayload {
     data: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct RenameJournalPayload {
+    ino: u64,
+    new_parent: u64,
+    new_name: String,
+    is_dir: bool,
+    perm: u16,
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+}
+
 fn database_io_error(error: rusqlite::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::Other,
@@ -141,7 +155,6 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
     }
 
     let mut output = [0u8; N];
-
     output.copy_from_slice(&payload[*cursor..*cursor + N]);
 
     *cursor += N;
@@ -150,23 +163,18 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
 }
 
 /* ============================================================
- * CREATE JOURNAL PAYLOAD
+ * CREATE JOURNAL
  * ============================================================
  */
 
 fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     let name_bytes = entry.name.as_bytes();
 
-    let mut payload = Vec::with_capacity(
-        CREATE_PAYLOAD_MAGIC.len() + 8 + 8 + 2 + 8 + 8 + 8 + 4 + name_bytes.len(),
-    );
+    let mut payload = Vec::new();
 
     payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
-
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
-
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
-
     payload.extend_from_slice(&entry.perm.to_le_bytes());
 
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
@@ -186,14 +194,14 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     if payload.len() < CREATE_PAYLOAD_MAGIC.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "CREATE journal payload is too short",
+            "CREATE payload is too short",
         ));
     }
 
     if &payload[..CREATE_PAYLOAD_MAGIC.len()] != CREATE_PAYLOAD_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "CREATE journal payload has invalid magic",
+            "invalid CREATE payload magic",
         ));
     }
 
@@ -216,14 +224,14 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     if payload.len().saturating_sub(cursor) != name_length {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "CREATE journal filename length is invalid",
+            "invalid CREATE filename length",
         ));
     }
 
     let name = String::from_utf8(payload[cursor..].to_vec()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            "CREATE journal filename is not valid UTF-8",
+            "CREATE filename is not valid UTF-8",
         )
     })?;
 
@@ -239,20 +247,8 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
 }
 
 fn apply_create_payload(txid: u64, payload: &CreateJournalPayload) -> io::Result<()> {
-    /*
-     * Data block is persisted first.
-     *
-     * If we crash after this point but before SQLite commit,
-     * the committed REDO transaction will simply recreate it.
-     */
     storage::save_file_data(payload.ino, &[])?;
 
-    /*
-     * Metadata + applied_tx are committed atomically.
-     *
-     * If applied_tx exists, metadata is guaranteed to have
-     * been committed in the same SQLite transaction.
-     */
     db::save_entry_metadata_with_times_and_mark_tx(
         txid,
         payload.ino,
@@ -271,61 +267,31 @@ fn apply_create_payload(txid: u64, payload: &CreateJournalPayload) -> io::Result
 }
 
 /* ============================================================
- * WRITE JOURNAL PAYLOAD
+ * WRITE JOURNAL
  * ============================================================
  */
 
 fn encode_write_payload(payload: &WriteJournalPayload) -> io::Result<Vec<u8>> {
     let name_bytes = payload.name.as_bytes();
 
-    let name_length = u32::try_from(name_bytes.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "WRITE filename too large for journal",
-        )
-    })?;
+    let name_length = u32::try_from(name_bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WRITE filename too large"))?;
 
-    let data_length = u64::try_from(payload.data.len()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "WRITE data too large for journal",
-        )
-    })?;
+    let data_length = u64::try_from(payload.data.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "WRITE data too large"))?;
 
-    let mut output = Vec::with_capacity(
-        WRITE_PAYLOAD_MAGIC.len()
-            + 8
-            + 8
-            + 2
-            + 8
-            + 8
-            + 8
-            + 4
-            + 8
-            + name_bytes.len()
-            + payload.data.len(),
-    );
+    let mut output = Vec::new();
 
     output.extend_from_slice(WRITE_PAYLOAD_MAGIC);
-
     output.extend_from_slice(&payload.ino.to_le_bytes());
-
     output.extend_from_slice(&payload.parent.to_le_bytes());
-
     output.extend_from_slice(&payload.perm.to_le_bytes());
-
     output.extend_from_slice(&payload.atime.to_le_bytes());
-
     output.extend_from_slice(&payload.mtime.to_le_bytes());
-
     output.extend_from_slice(&payload.ctime.to_le_bytes());
-
     output.extend_from_slice(&name_length.to_le_bytes());
-
     output.extend_from_slice(&data_length.to_le_bytes());
-
     output.extend_from_slice(name_bytes);
-
     output.extend_from_slice(&payload.data);
 
     Ok(output)
@@ -335,14 +301,14 @@ fn decode_write_payload(payload: &[u8]) -> io::Result<WriteJournalPayload> {
     if payload.len() < WRITE_PAYLOAD_MAGIC.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "WRITE journal payload is too short",
+            "WRITE payload is too short",
         ));
     }
 
     if &payload[..WRITE_PAYLOAD_MAGIC.len()] != WRITE_PAYLOAD_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "WRITE journal payload has invalid magic",
+            "invalid WRITE payload magic",
         ));
     }
 
@@ -364,35 +330,24 @@ fn decode_write_payload(payload: &[u8]) -> io::Result<WriteJournalPayload> {
 
     let data_length_u64 = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
-    let data_length = usize::try_from(data_length_u64).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "WRITE journal data length does not fit memory",
-        )
+    let data_length = usize::try_from(data_length_u64)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WRITE data length too large"))?;
+
+    let remaining = name_length.checked_add(data_length).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "WRITE payload length overflow")
     })?;
 
-    let remaining_length = name_length.checked_add(data_length).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "WRITE journal payload length overflow",
-        )
-    })?;
-
-    if payload.len().saturating_sub(cursor) != remaining_length {
+    if payload.len().saturating_sub(cursor) != remaining {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "WRITE journal payload length is invalid",
+            "invalid WRITE payload length",
         ));
     }
 
     let name_end = cursor + name_length;
 
-    let name = String::from_utf8(payload[cursor..name_end].to_vec()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "WRITE journal filename is not valid UTF-8",
-        )
-    })?;
+    let name = String::from_utf8(payload[cursor..name_end].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WRITE filename invalid UTF-8"))?;
 
     let data = payload[name_end..].to_vec();
 
@@ -409,20 +364,8 @@ fn decode_write_payload(payload: &[u8]) -> io::Result<WriteJournalPayload> {
 }
 
 fn apply_write_payload(txid: u64, payload: &WriteJournalPayload) -> io::Result<()> {
-    /*
-     * The journal stores the COMPLETE final file image.
-     *
-     * Therefore replay does not depend on the old contents.
-     * Running replay multiple times produces identical bytes.
-     */
     storage::save_file_data(payload.ino, &payload.data)?;
 
-    /*
-     * Metadata and applied_tx are committed atomically.
-     *
-     * applied_tx therefore acts as a reliable idempotency
-     * marker for this WRITE transaction.
-     */
     db::save_entry_metadata_with_times_and_mark_tx(
         txid,
         payload.ino,
@@ -431,6 +374,122 @@ fn apply_write_payload(txid: u64, payload: &WriteJournalPayload) -> io::Result<(
         false,
         payload.perm,
         payload.data.len() as u64,
+        payload.atime,
+        payload.mtime,
+        payload.ctime,
+    )
+    .map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
+ * RENAME JOURNAL
+ * ============================================================
+ */
+
+fn encode_rename_payload(payload: &RenameJournalPayload) -> io::Result<Vec<u8>> {
+    let name_bytes = payload.new_name.as_bytes();
+
+    let name_length = u32::try_from(name_bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RENAME filename too large"))?;
+
+    let mut output = Vec::new();
+
+    output.extend_from_slice(RENAME_PAYLOAD_MAGIC);
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+    output.extend_from_slice(&payload.new_parent.to_le_bytes());
+
+    output.push(if payload.is_dir { 1 } else { 0 });
+
+    output.extend_from_slice(&payload.perm.to_le_bytes());
+    output.extend_from_slice(&payload.size.to_le_bytes());
+    output.extend_from_slice(&payload.atime.to_le_bytes());
+    output.extend_from_slice(&payload.mtime.to_le_bytes());
+    output.extend_from_slice(&payload.ctime.to_le_bytes());
+    output.extend_from_slice(&name_length.to_le_bytes());
+    output.extend_from_slice(name_bytes);
+
+    Ok(output)
+}
+
+fn decode_rename_payload(payload: &[u8]) -> io::Result<RenameJournalPayload> {
+    if payload.len() < RENAME_PAYLOAD_MAGIC.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RENAME payload too short",
+        ));
+    }
+
+    if &payload[..RENAME_PAYLOAD_MAGIC.len()] != RENAME_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid RENAME payload magic",
+        ));
+    }
+
+    let mut cursor = RENAME_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let new_parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let is_dir = match read_array::<1>(payload, &mut cursor)?[0] {
+        0 => false,
+        1 => true,
+
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid RENAME directory flag",
+            ));
+        }
+    };
+
+    let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
+    let size = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
+
+    if payload.len().saturating_sub(cursor) != name_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid RENAME filename length",
+        ));
+    }
+
+    let new_name = String::from_utf8(payload[cursor..].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "RENAME filename invalid UTF-8"))?;
+
+    Ok(RenameJournalPayload {
+        ino,
+        new_parent,
+        new_name,
+        is_dir,
+        perm,
+        size,
+        atime,
+        mtime,
+        ctime,
+    })
+}
+
+fn apply_rename_payload(txid: u64, payload: &RenameJournalPayload) -> io::Result<()> {
+    db::save_entry_metadata_with_times_and_mark_tx(
+        txid,
+        payload.ino,
+        payload.new_parent,
+        &payload.new_name,
+        payload.is_dir,
+        payload.perm,
+        payload.size,
         payload.atime,
         payload.mtime,
         payload.ctime,
@@ -459,6 +518,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             apply_write_payload(transaction.txid, &payload)
         }
 
+        "RENAME" => {
+            let payload = decode_rename_payload(&transaction.payload)?;
+
+            apply_rename_payload(transaction.txid, &payload)
+        }
+
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported committed journal operation: {other}"),
@@ -467,7 +532,7 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
 }
 
 /* ============================================================
- * FILESYSTEM STATE LOADING
+ * STATE LOAD
  * ============================================================
  */
 
@@ -576,11 +641,6 @@ impl Ccfs {
     }
 }
 
-/* ============================================================
- * ATTRIBUTE HELPERS
- * ============================================================
- */
-
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: INodeNo::ROOT,
@@ -620,21 +680,13 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
         ino: entry.ino,
         size,
         blocks: (size + 511) / 512,
-
         atime: entry.atime,
-
         mtime: entry.mtime,
-
         ctime: entry.ctime,
-
         crtime: entry.ctime,
-
         kind: entry_kind(entry),
-
         perm: entry.perm,
-
         nlink: if entry.is_dir { 2 } else { 1 },
-
         uid: 1000,
         gid: 1000,
         rdev: 0,
@@ -694,7 +746,7 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
 }
 
 /* ============================================================
- * CHECKSUM / INTEGRITY COMMANDS
+ * ADMIN COMMANDS
  * ============================================================
  */
 
@@ -710,7 +762,6 @@ fn migrate_checksums() {
     };
 
     println!("CCFS checksum migration");
-
     println!("-----------------------");
 
     let entries = match db::load_entries() {
@@ -793,7 +844,6 @@ fn migrate_checksums() {
     };
 
     println!();
-
     println!("Migration completed.");
 
     println!("Legacy empty blocks repaired: {}", repaired_empty_files);
@@ -813,7 +863,6 @@ fn check_integrity() {
     };
 
     println!("CCFS integrity check");
-
     println!("--------------------");
 
     let entries = match db::load_entries() {
@@ -950,25 +999,6 @@ fn print_usage() {
     println!("  ccfs --migrate-checksums");
     println!("  ccfs --check-integrity");
     println!("  ccfs --recovery-status");
-    println!();
-
-    println!("Commands:");
-
-    println!("  --migrate-checksums");
-
-    println!("      Repair legacy empty-file blocks and create missing checksums.");
-
-    println!();
-
-    println!("  --check-integrity");
-
-    println!("      Compare SQLite metadata, data blocks and stored checksums.");
-
-    println!();
-
-    println!("  --recovery-status");
-
-    println!("      Show journal and applied transaction recovery state.");
 }
 
 /* ============================================================
@@ -1110,7 +1140,6 @@ impl Filesystem for Ccfs {
 
         if let Some(value) = ctime {
             entry.ctime = value;
-
             changed = true;
         }
 
@@ -1310,22 +1339,13 @@ impl Filesystem for Ccfs {
 
         let attr = entry_attr(&entry);
 
-        /*
-         * REDO CREATE:
-         *
-         * BEGIN -> fsync
-         * COMMIT -> fsync
-         * apply block
-         * metadata + applied_tx atomic commit
-         */
+        let encoded_payload = encode_create_payload(&entry);
 
-        let journal_payload = encode_create_payload(&entry);
-
-        let txid = match journal::begin_transaction("CREATE", &journal_payload) {
+        let txid = match journal::begin_transaction("CREATE", &encoded_payload) {
             Ok(txid) => txid,
 
             Err(err) => {
-                eprintln!("Failed to write CREATE BEGIN record: {}", err);
+                eprintln!("Failed CREATE BEGIN: {}", err);
 
                 reply.error(Errno::EIO);
 
@@ -1334,14 +1354,14 @@ impl Filesystem for Ccfs {
         };
 
         if let Err(err) = journal::commit_transaction(txid) {
-            eprintln!("Failed to write CREATE COMMIT record: {}", err);
+            eprintln!("Failed CREATE COMMIT: {}", err);
 
             reply.error(Errno::EIO);
 
             return;
         }
 
-        let create_payload = CreateJournalPayload {
+        let payload = CreateJournalPayload {
             ino: ino_value,
 
             parent: u64::from(parent),
@@ -1357,11 +1377,8 @@ impl Filesystem for Ccfs {
             ctime: system_time_to_timestamp(entry.ctime),
         };
 
-        if let Err(err) = apply_create_payload(txid, &create_payload) {
-            eprintln!(
-                "Committed CREATE transaction {} could not be applied: {}",
-                txid, err
-            );
+        if let Err(err) = apply_create_payload(txid, &payload) {
+            eprintln!("Committed CREATE {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
 
@@ -1485,7 +1502,7 @@ impl Filesystem for Ccfs {
         }
 
         if let Err(err) = db::delete_entry_metadata(ino_value) {
-            eprintln!("Failed to delete directory metadata: {}", err);
+            eprintln!("Failed directory metadata delete: {}", err);
 
             reply.error(Errno::EIO);
 
@@ -1562,49 +1579,95 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        let is_dir = state
-            .entries
-            .get(&ino_value)
-            .map(|entry| entry.is_dir)
-            .unwrap_or(false);
-
-        if is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
-            reply.error(Errno::EINVAL);
-
-            return;
-        }
-
-        let Some(entry) = state.entries.get_mut(&ino_value) else {
+        let Some(current_entry) = state.entries.get(&ino_value) else {
             reply.error(Errno::ENOENT);
 
             return;
         };
 
-        let old_parent = entry.parent;
+        if current_entry.is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
+            reply.error(Errno::EINVAL);
 
-        let old_entry_name = entry.name.clone();
+            return;
+        }
 
-        let old_ctime = entry.ctime;
+        let now = SystemTime::now();
 
-        entry.parent = newparent;
+        let rename_payload = RenameJournalPayload {
+            ino: ino_value,
 
-        entry.name = new_name;
+            new_parent: u64::from(newparent),
 
-        entry.ctime = SystemTime::now();
+            new_name: new_name.clone(),
 
-        if let Err(err) = persist_entry(entry) {
-            entry.parent = old_parent;
+            is_dir: current_entry.is_dir,
 
-            entry.name = old_entry_name;
+            perm: current_entry.perm,
 
-            entry.ctime = old_ctime;
+            size: if current_entry.is_dir {
+                0
+            } else {
+                current_entry.data.len() as u64
+            },
 
-            eprintln!("Failed to persist rename: {}", err);
+            atime: system_time_to_timestamp(current_entry.atime),
+
+            mtime: system_time_to_timestamp(current_entry.mtime),
+
+            ctime: system_time_to_timestamp(now),
+        };
+
+        let encoded_payload = match encode_rename_payload(&rename_payload) {
+            Ok(payload) => payload,
+
+            Err(err) => {
+                eprintln!("Failed to encode RENAME payload: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        let txid = match journal::begin_transaction("RENAME", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed RENAME BEGIN: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed RENAME COMMIT: {}", err);
 
             reply.error(Errno::EIO);
 
             return;
         }
+
+        if let Err(err) = apply_rename_payload(txid, &rename_payload) {
+            eprintln!("Committed RENAME {} apply failed: {}", txid, err);
+
+            reply.error(Errno::EIO);
+
+            return;
+        }
+
+        let Some(entry) = state.entries.get_mut(&ino_value) else {
+            reply.error(Errno::EIO);
+
+            return;
+        };
+
+        entry.parent = newparent;
+
+        entry.name = new_name;
+
+        entry.ctime = now;
 
         reply.ok();
     }
@@ -1637,7 +1700,7 @@ impl Filesystem for Ccfs {
         entry.atime = SystemTime::now();
 
         if let Err(err) = persist_entry(entry) {
-            eprintln!("Failed to persist access time: {}", err);
+            eprintln!("Failed access-time persistence: {}", err);
 
             reply.error(Errno::EIO);
 
@@ -1684,7 +1747,7 @@ impl Filesystem for Ccfs {
         }
 
         let start = match usize::try_from(offset) {
-            Ok(start) => start,
+            Ok(value) => value,
 
             Err(_) => {
                 reply.error(Errno::EFBIG);
@@ -1694,7 +1757,7 @@ impl Filesystem for Ccfs {
         };
 
         let end = match start.checked_add(data.len()) {
-            Some(end) => end,
+            Some(value) => value,
 
             None => {
                 reply.error(Errno::EFBIG);
@@ -1703,12 +1766,6 @@ impl Filesystem for Ccfs {
             }
         };
 
-        /*
-         * Build the complete FINAL file image in memory first.
-         *
-         * We do not mutate the live MemoryEntry until the
-         * committed transaction has been applied successfully.
-         */
         let mut final_data = entry.data.clone();
 
         if final_data.len() < start {
@@ -1723,7 +1780,7 @@ impl Filesystem for Ccfs {
 
         let now = SystemTime::now();
 
-        let write_payload = WriteJournalPayload {
+        let payload = WriteJournalPayload {
             ino: u64::from(entry.ino),
 
             parent: u64::from(entry.parent),
@@ -1741,11 +1798,11 @@ impl Filesystem for Ccfs {
             data: final_data.clone(),
         };
 
-        let encoded_payload = match encode_write_payload(&write_payload) {
-            Ok(payload) => payload,
+        let encoded = match encode_write_payload(&payload) {
+            Ok(encoded) => encoded,
 
             Err(err) => {
-                eprintln!("Failed to encode WRITE journal payload: {}", err);
+                eprintln!("Failed WRITE payload encode: {}", err);
 
                 reply.error(Errno::EIO);
 
@@ -1753,22 +1810,11 @@ impl Filesystem for Ccfs {
             }
         };
 
-        /*
-         * REDO WRITE:
-         *
-         * 1. BEGIN contains COMPLETE final file image
-         * 2. BEGIN fsync
-         * 3. COMMIT
-         * 4. COMMIT fsync
-         * 5. write data + checksum
-         * 6. metadata + applied_tx atomic SQLite transaction
-         */
-
-        let txid = match journal::begin_transaction("WRITE", &encoded_payload) {
+        let txid = match journal::begin_transaction("WRITE", &encoded) {
             Ok(txid) => txid,
 
             Err(err) => {
-                eprintln!("Failed to write WRITE BEGIN record: {}", err);
+                eprintln!("Failed WRITE BEGIN: {}", err);
 
                 reply.error(Errno::EIO);
 
@@ -1777,33 +1823,21 @@ impl Filesystem for Ccfs {
         };
 
         if let Err(err) = journal::commit_transaction(txid) {
-            eprintln!("Failed to write WRITE COMMIT record: {}", err);
+            eprintln!("Failed WRITE COMMIT: {}", err);
 
             reply.error(Errno::EIO);
 
             return;
         }
 
-        if let Err(err) = apply_write_payload(txid, &write_payload) {
-            /*
-             * COMMIT is already durable.
-             *
-             * Do NOT mark the transaction applied manually.
-             * Startup recovery will replay the complete final image.
-             */
-            eprintln!(
-                "Committed WRITE transaction {} could not be applied: {}",
-                txid, err
-            );
+        if let Err(err) = apply_write_payload(txid, &payload) {
+            eprintln!("Committed WRITE {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
 
             return;
         }
 
-        /*
-         * Only now update live in-memory state.
-         */
         entry.data = final_data;
 
         entry.mtime = now;
@@ -1868,8 +1902,6 @@ fn main() {
 
             unknown => {
                 eprintln!("Unknown argument: {}", unknown);
-
-                eprintln!();
 
                 print_usage();
 
