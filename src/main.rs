@@ -1,8 +1,12 @@
 mod db;
 mod storage;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::ffi::OsStr;
+use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
+use std::process;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +16,24 @@ use fuser::{
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
+use storage::IntegrityStatus;
+
 const TTL: Duration = Duration::from_secs(1);
+const NAME_MAX: usize = 255;
+
+fn validate_name(name: &OsStr) -> Result<(), Errno> {
+    let bytes = name.as_bytes();
+
+    if bytes.is_empty() {
+        return Err(Errno::EINVAL);
+    }
+
+    if bytes.len() > NAME_MAX {
+        return Err(Errno::ENAMETOOLONG);
+    }
+
+    Ok(())
+}
 
 struct MemoryEntry {
     ino: INodeNo,
@@ -79,7 +100,6 @@ fn persist_entry(entry: &MemoryEntry) -> rusqlite::Result<()> {
 impl Ccfs {
     fn new() -> Self {
         let mut entries = BTreeMap::new();
-
         let now = SystemTime::now();
 
         entries.insert(
@@ -111,8 +131,40 @@ impl Ccfs {
                     let data = if meta.is_dir {
                         Vec::new()
                     } else {
-                        storage::load_file_data(meta.ino)
-                            .unwrap_or_else(|_| vec![0; meta.size as usize])
+                        match storage::load_file_data(meta.ino) {
+                            Ok(data) => data,
+
+                            // Legacy zero-byte files created before block storage
+                            // initialization may have metadata but no .bin file.
+                            Err(err) if err.kind() == ErrorKind::NotFound && meta.size == 0 => {
+                                match storage::save_file_data(meta.ino, &[]) {
+                                    Ok(()) => {
+                                        eprintln!(
+                                            "Repaired legacy empty file storage for inode {}",
+                                            meta.ino
+                                        );
+                                    }
+
+                                    Err(init_err) => {
+                                        eprintln!(
+                                            "Failed to repair empty inode {}: {}",
+                                            meta.ino, init_err
+                                        );
+                                    }
+                                }
+
+                                Vec::new()
+                            }
+
+                            Err(err) => {
+                                eprintln!(
+                                    "Failed to load file data for inode {}: {}",
+                                    meta.ino, err
+                                );
+
+                                vec![0; meta.size as usize]
+                            }
+                        }
                     };
 
                     entries.insert(
@@ -233,7 +285,6 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
         };
 
         current = entry.parent;
-
         steps += 1;
 
         if steps > state.entries.len() {
@@ -244,8 +295,230 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
     false
 }
 
+fn migrate_checksums() {
+    let _db = match db::init_database() {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Failed to initialize metadata database: {}", err);
+            process::exit(1);
+        }
+    };
+
+    println!("CCFS checksum migration");
+    println!("-----------------------");
+
+    let entries = match db::load_entries() {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("Failed to load metadata: {}", err);
+            process::exit(1);
+        }
+    };
+
+    let mut repaired_empty_files = 0usize;
+    let mut unrecoverable_missing_blocks = 0usize;
+
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+
+        match storage::verify_file_data(entry.ino) {
+            Ok(IntegrityStatus::MissingData) if entry.size == 0 => {
+                match storage::save_file_data(entry.ino, &[]) {
+                    Ok(()) => {
+                        repaired_empty_files += 1;
+
+                        println!("[REPAIR] inode {}: initialized empty data block", entry.ino);
+                    }
+
+                    Err(err) => {
+                        eprintln!(
+                            "[FAIL] inode {}: unable to initialize empty block: {}",
+                            entry.ino, err
+                        );
+
+                        process::exit(1);
+                    }
+                }
+            }
+
+            Ok(IntegrityStatus::MissingData) => {
+                unrecoverable_missing_blocks += 1;
+
+                eprintln!(
+                    "[FAIL] inode {}: {} byte file has no data block",
+                    entry.ino, entry.size
+                );
+            }
+
+            Ok(_) => {}
+
+            Err(err) => {
+                eprintln!("[FAIL] inode {}: integrity read error: {}", entry.ino, err);
+
+                process::exit(1);
+            }
+        }
+    }
+
+    if unrecoverable_missing_blocks > 0 {
+        eprintln!();
+        eprintln!(
+            "Migration stopped: {} non-empty file(s) are missing data blocks.",
+            unrecoverable_missing_blocks
+        );
+
+        process::exit(2);
+    }
+
+    let migrated_checksums = match storage::migrate_missing_checksums() {
+        Ok(count) => count,
+
+        Err(err) => {
+            eprintln!("Checksum migration failed: {}", err);
+            process::exit(1);
+        }
+    };
+
+    println!();
+    println!("Migration completed.");
+    println!("Legacy empty blocks repaired: {}", repaired_empty_files);
+    println!("Checksums created: {}", migrated_checksums);
+}
+
+fn check_integrity() {
+    let _db = match db::init_database() {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Failed to initialize metadata database: {}", err);
+            process::exit(1);
+        }
+    };
+
+    println!("CCFS integrity check");
+    println!("--------------------");
+
+    let entries = match db::load_entries() {
+        Ok(entries) => entries,
+
+        Err(err) => {
+            eprintln!("Unable to read filesystem metadata: {}", err);
+            process::exit(1);
+        }
+    };
+
+    let mut failures = 0usize;
+    let mut regular_file_inodes = BTreeSet::new();
+
+    for entry in entries {
+        if entry.is_dir {
+            continue;
+        }
+
+        regular_file_inodes.insert(entry.ino);
+
+        match storage::verify_file_data(entry.ino) {
+            Ok(IntegrityStatus::Healthy) => {
+                println!("[PASS] inode {}: {} healthy", entry.ino, entry.name);
+            }
+
+            Ok(IntegrityStatus::MissingData) => {
+                failures += 1;
+
+                println!(
+                    "[FAIL] inode {}: {} data block missing",
+                    entry.ino, entry.name
+                );
+            }
+
+            Ok(IntegrityStatus::MissingChecksum) => {
+                failures += 1;
+
+                println!(
+                    "[FAIL] inode {}: {} checksum missing",
+                    entry.ino, entry.name
+                );
+            }
+
+            Ok(IntegrityStatus::Corrupted { expected, actual }) => {
+                failures += 1;
+
+                println!(
+                    "[FAIL] inode {}: {} checksum mismatch \
+                     expected={:016x} actual={:016x}",
+                    entry.ino, entry.name, expected, actual
+                );
+            }
+
+            Err(err) => {
+                failures += 1;
+
+                println!(
+                    "[FAIL] inode {}: {} integrity error: {}",
+                    entry.ino, entry.name, err
+                );
+            }
+        }
+    }
+
+    match storage::list_block_inodes() {
+        Ok(block_inodes) => {
+            for ino in block_inodes {
+                if !regular_file_inodes.contains(&ino) {
+                    failures += 1;
+
+                    println!(
+                        "[FAIL] inode {}: orphan data block has no regular-file metadata",
+                        ino
+                    );
+                }
+            }
+        }
+
+        Err(err) => {
+            failures += 1;
+            println!("[FAIL] unable to enumerate block files: {}", err);
+        }
+    }
+
+    println!();
+
+    if failures == 0 {
+        println!("ALL CCFS BLOCKS PASSED INTEGRITY CHECK");
+    } else {
+        println!(
+            "CCFS INTEGRITY CHECK FAILED: {} problem(s) detected",
+            failures
+        );
+
+        process::exit(2);
+    }
+}
+
+fn print_usage() {
+    println!("CCFS");
+    println!();
+    println!("Usage:");
+    println!("  ccfs");
+    println!("  ccfs --migrate-checksums");
+    println!("  ccfs --check-integrity");
+    println!();
+    println!("Commands:");
+    println!("  --migrate-checksums");
+    println!("      Repair legacy empty-file blocks and create missing checksums.");
+    println!();
+    println!("  --check-integrity");
+    println!("      Compare SQLite metadata, data blocks and stored checksums.");
+}
+
 impl Filesystem for Ccfs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
+
         let state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -437,8 +710,12 @@ impl Filesystem for Ccfs {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let name = name.to_string_lossy().into_owned();
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
 
+        let name = name.to_string_lossy().into_owned();
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -491,8 +768,12 @@ impl Filesystem for Ccfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let name = name.to_string_lossy().into_owned();
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
 
+        let name = name.to_string_lossy().into_owned();
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -524,7 +805,18 @@ impl Filesystem for Ccfs {
 
         let attr = entry_attr(&entry);
 
+        // Every regular file, including a zero-byte file, receives
+        // an actual persistent block and checksum immediately.
+        if let Err(err) = storage::save_file_data(ino_value, &[]) {
+            eprintln!("Failed to initialize empty file storage: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
         if let Err(err) = persist_entry(&entry) {
+            // Avoid leaving an orphan block if metadata insertion fails.
+            let _ = storage::delete_file_data(ino_value);
+
             eprintln!("Failed to persist file metadata: {}", err);
             reply.error(Errno::EIO);
             return;
@@ -542,8 +834,12 @@ impl Filesystem for Ccfs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy().into_owned();
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
 
+        let name = name.to_string_lossy().into_owned();
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -589,8 +885,12 @@ impl Filesystem for Ccfs {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let name = name.to_string_lossy().into_owned();
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
 
+        let name = name.to_string_lossy().into_owned();
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -645,6 +945,16 @@ impl Filesystem for Ccfs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        if let Err(err) = validate_name(name) {
+            reply.error(err);
+            return;
+        }
+
+        if let Err(err) = validate_name(newname) {
+            reply.error(err);
+            return;
+        }
+
         if !flags.is_empty() {
             reply.error(Errno::EINVAL);
             return;
@@ -803,7 +1113,6 @@ impl Filesystem for Ccfs {
         entry.data[start..end].copy_from_slice(data);
 
         let now = SystemTime::now();
-
         entry.mtime = now;
         entry.ctime = now;
 
@@ -846,6 +1155,34 @@ impl Filesystem for Ccfs {
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() > 1 {
+        match args[1].as_str() {
+            "--migrate-checksums" => {
+                migrate_checksums();
+                return;
+            }
+
+            "--check-integrity" => {
+                check_integrity();
+                return;
+            }
+
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+
+            unknown => {
+                eprintln!("Unknown argument: {}", unknown);
+                eprintln!();
+                print_usage();
+                process::exit(2);
+            }
+        }
+    }
+
     let _db = db::init_database().expect("Failed to initialize SQLite database");
 
     println!("SQLite metadata database ready.");
