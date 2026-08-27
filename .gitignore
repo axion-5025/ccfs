@@ -6,3 +6,4 @@ volume/*.db-wal
 volume/*.db-shm
 volume/blocks/*
 !volume/blocks/.gitkeep
+volume/journal.log
