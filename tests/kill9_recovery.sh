@@ -31,6 +31,9 @@ WRITE_COMMIT_NAME="k9-write-commit-$RUN_ID.txt"
 TRUNCATE_BEGIN_NAME="k9-truncate-begin-$RUN_ID.txt"
 TRUNCATE_COMMIT_NAME="k9-truncate-commit-$RUN_ID.txt"
 
+SETATTR_BEGIN_NAME="k9-setattr-begin-$RUN_ID.txt"
+SETATTR_COMMIT_NAME="k9-setattr-commit-$RUN_ID.txt"
+
 RENAME_BEGIN_OLD="k9-rename-begin-old-$RUN_ID.txt"
 RENAME_BEGIN_NEW="k9-rename-begin-new-$RUN_ID.txt"
 
@@ -224,6 +227,15 @@ sql_name_count() {
          WHERE name='$name';"
 }
 
+sql_name_perm() {
+    local name="$1"
+
+    sqlite3 volume/metadata.db \
+        "SELECT perm
+         FROM entries
+         WHERE name='$name';"
+}
+
 assert_file_text() {
     local path="$1"
     local expected="$2"
@@ -334,7 +346,7 @@ echo " CCFS REAL SIGKILL Recovery Test Suite"
 echo "========================================"
 echo
 
-echo "[1/16] Snapshotting original volume and building CCFS..."
+echo "[1/18] Snapshotting original volume and building CCFS..."
 
 snapshot_volume
 
@@ -351,7 +363,7 @@ pass "volume snapshot created and CCFS built"
 # ============================================================
 
 echo
-echo "[2/16] CREATE crash after BEGIN..."
+echo "[2/18] CREATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -387,7 +399,7 @@ pass "CREATE killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[3/16] CREATE crash after COMMIT..."
+echo "[3/18] CREATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -425,7 +437,7 @@ pass "CREATE killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[4/16] MKDIR crash after BEGIN..."
+echo "[4/18] MKDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -461,7 +473,7 @@ pass "MKDIR killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[5/16] MKDIR crash after COMMIT..."
+echo "[5/18] MKDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -502,7 +514,7 @@ pass "MKDIR killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[6/16] RMDIR crash after BEGIN..."
+echo "[6/18] RMDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -549,7 +561,7 @@ pass "RMDIR killed after BEGIN preserved directory"
 # ============================================================
 
 echo
-echo "[7/16] RMDIR crash after COMMIT..."
+echo "[7/18] RMDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -601,7 +613,7 @@ pass "RMDIR killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[8/16] WRITE crash after BEGIN..."
+echo "[8/18] WRITE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -677,7 +689,7 @@ pass "WRITE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[9/16] WRITE crash after COMMIT..."
+echo "[9/18] WRITE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -755,7 +767,7 @@ pass "WRITE killed after COMMIT recovered exact data"
 # ============================================================
 
 echo
-echo "[10/16] TRUNCATE crash after BEGIN..."
+echo "[10/18] TRUNCATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -821,7 +833,7 @@ pass "TRUNCATE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[11/16] TRUNCATE crash after COMMIT..."
+echo "[11/18] TRUNCATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -883,11 +895,142 @@ run_integrity_check
 pass "TRUNCATE killed after COMMIT recovered exact size and data"
 
 # ============================================================
+# SETATTR — AFTER BEGIN
+# ============================================================
+
+echo
+echo "[12/18] SETATTR crash after BEGIN..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "SETATTR-BEGIN-DATA" \
+    > "$MOUNT_DIR/$SETATTR_BEGIN_NAME"
+
+chmod 644 \
+    "$MOUNT_DIR/$SETATTR_BEGIN_NAME"
+
+OLD_SETATTR_BEGIN_PERM="$(
+    sql_name_perm \
+        "$SETATTR_BEGIN_NAME"
+)"
+
+[[ "$OLD_SETATTR_BEGIN_PERM" == "420" ]] ||
+    fail "SETATTR-after-BEGIN setup permission is not 0644"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "SETATTR" \
+    "after_begin"
+
+timeout 5 \
+    chmod 600 \
+    "$MOUNT_DIR/$SETATTR_BEGIN_NAME" \
+    2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_perm "$SETATTR_BEGIN_NAME")" == "$OLD_SETATTR_BEGIN_PERM" ]] ||
+    fail "SETATTR-after-BEGIN changed durable permissions"
+
+start_normal_ccfs
+
+CURRENT_MODE="$(
+    stat -c '%a' \
+        "$MOUNT_DIR/$SETATTR_BEGIN_NAME"
+)"
+
+[[ "$CURRENT_MODE" == "644" ]] ||
+    fail "incomplete SETATTR changed mode after restart"
+
+grep -q \
+    "incomplete ignored: 1" \
+    "$RECOVERY_LOG" ||
+    fail "SETATTR-after-BEGIN was not classified incomplete"
+
+stop_ccfs
+
+run_integrity_check
+
+pass "SETATTR killed after BEGIN preserved old metadata"
+
+# ============================================================
+# SETATTR — AFTER COMMIT
+# ============================================================
+
+echo
+echo "[13/18] SETATTR crash after COMMIT..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "SETATTR-COMMIT-DATA" \
+    > "$MOUNT_DIR/$SETATTR_COMMIT_NAME"
+
+chmod 644 \
+    "$MOUNT_DIR/$SETATTR_COMMIT_NAME"
+
+OLD_SETATTR_COMMIT_PERM="$(
+    sql_name_perm \
+        "$SETATTR_COMMIT_NAME"
+)"
+
+[[ "$OLD_SETATTR_COMMIT_PERM" == "420" ]] ||
+    fail "SETATTR-after-COMMIT setup permission is not 0644"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "SETATTR" \
+    "after_commit"
+
+timeout 5 \
+    chmod 600 \
+    "$MOUNT_DIR/$SETATTR_COMMIT_NAME" \
+    2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_perm "$SETATTR_COMMIT_NAME")" == "$OLD_SETATTR_COMMIT_PERM" ]] ||
+    fail "SETATTR-after-COMMIT applied before intended crash"
+
+start_normal_ccfs
+
+CURRENT_MODE="$(
+    stat -c '%a' \
+        "$MOUNT_DIR/$SETATTR_COMMIT_NAME"
+)"
+
+[[ "$CURRENT_MODE" == "600" ]] ||
+    fail "committed SETATTR permission was not recovered"
+
+grep -q \
+    "replayed: 1" \
+    "$RECOVERY_LOG" ||
+    fail "committed SETATTR did not replay"
+
+stop_ccfs
+
+[[ "$(sql_name_perm "$SETATTR_COMMIT_NAME")" == "384" ]] ||
+    fail "recovered SETATTR durable permission is incorrect"
+
+run_integrity_check
+
+pass "SETATTR killed after COMMIT recovered metadata"
+
+# ============================================================
 # RENAME — AFTER BEGIN
 # ============================================================
 
 echo
-echo "[12/16] RENAME crash after BEGIN..."
+echo "[14/18] RENAME crash after BEGIN..."
 
 clear_recovery_state
 
@@ -944,7 +1087,7 @@ pass "RENAME killed after BEGIN preserved old namespace"
 # ============================================================
 
 echo
-echo "[13/16] RENAME crash after COMMIT..."
+echo "[15/18] RENAME crash after COMMIT..."
 
 clear_recovery_state
 
@@ -1008,7 +1151,7 @@ pass "RENAME killed after COMMIT recovered namespace"
 # ============================================================
 
 echo
-echo "[14/16] DELETE crash after BEGIN..."
+echo "[16/18] DELETE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -1061,7 +1204,7 @@ pass "DELETE killed after BEGIN preserved file"
 # ============================================================
 
 echo
-echo "[15/16] DELETE crash after COMMIT..."
+echo "[17/18] DELETE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -1123,7 +1266,7 @@ pass "DELETE killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[16/16] Final integrity verification..."
+echo "[18/18] Final integrity verification..."
 
 run_integrity_check
 
