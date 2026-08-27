@@ -22,6 +22,9 @@ CREATE_COMMIT_NAME="k9-create-commit-$RUN_ID.txt"
 MKDIR_BEGIN_NAME="k9-mkdir-begin-$RUN_ID"
 MKDIR_COMMIT_NAME="k9-mkdir-commit-$RUN_ID"
 
+RMDIR_BEGIN_NAME="k9-rmdir-begin-$RUN_ID"
+RMDIR_COMMIT_NAME="k9-rmdir-commit-$RUN_ID"
+
 WRITE_BEGIN_NAME="k9-write-begin-$RUN_ID.txt"
 WRITE_COMMIT_NAME="k9-write-commit-$RUN_ID.txt"
 
@@ -323,7 +326,7 @@ echo " CCFS REAL SIGKILL Recovery Test Suite"
 echo "========================================"
 echo
 
-echo "[1/12] Snapshotting original volume and building CCFS..."
+echo "[1/14] Snapshotting original volume and building CCFS..."
 
 snapshot_volume
 
@@ -340,7 +343,7 @@ pass "volume snapshot created and CCFS built"
 # ============================================================
 
 echo
-echo "[2/12] CREATE crash after BEGIN..."
+echo "[2/14] CREATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -376,7 +379,7 @@ pass "CREATE killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[3/12] CREATE crash after COMMIT..."
+echo "[3/14] CREATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -414,7 +417,7 @@ pass "CREATE killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[4/12] MKDIR crash after BEGIN..."
+echo "[4/14] MKDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -450,7 +453,7 @@ pass "MKDIR killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[5/12] MKDIR crash after COMMIT..."
+echo "[5/14] MKDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -487,11 +490,110 @@ run_integrity_check
 pass "MKDIR killed after COMMIT recovered successfully"
 
 # ============================================================
+# RMDIR — AFTER BEGIN
+# ============================================================
+
+echo
+echo "[6/14] RMDIR crash after BEGIN..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+mkdir "$MOUNT_DIR/$RMDIR_BEGIN_NAME"
+
+[[ -d "$MOUNT_DIR/$RMDIR_BEGIN_NAME" ]] ||
+    fail "RMDIR-after-BEGIN setup directory missing"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "RMDIR" \
+    "after_begin"
+
+timeout 5 \
+    rmdir "$MOUNT_DIR/$RMDIR_BEGIN_NAME" \
+    2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_count "$RMDIR_BEGIN_NAME")" == "1" ]] ||
+    fail "RMDIR-after-BEGIN removed metadata before recovery"
+
+start_normal_ccfs
+
+[[ -d "$MOUNT_DIR/$RMDIR_BEGIN_NAME" ]] ||
+    fail "incomplete RMDIR removed directory after restart"
+
+grep -q \
+    "incomplete ignored: 1" \
+    "$RECOVERY_LOG" ||
+    fail "RMDIR-after-BEGIN was not classified incomplete"
+
+stop_ccfs
+
+pass "RMDIR killed after BEGIN preserved directory"
+
+# ============================================================
+# RMDIR — AFTER COMMIT
+# ============================================================
+
+echo
+echo "[7/14] RMDIR crash after COMMIT..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+mkdir "$MOUNT_DIR/$RMDIR_COMMIT_NAME"
+
+[[ -d "$MOUNT_DIR/$RMDIR_COMMIT_NAME" ]] ||
+    fail "RMDIR-after-COMMIT setup directory missing"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "RMDIR" \
+    "after_commit"
+
+timeout 5 \
+    rmdir "$MOUNT_DIR/$RMDIR_COMMIT_NAME" \
+    2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_count "$RMDIR_COMMIT_NAME")" == "1" ]] ||
+    fail "RMDIR-after-COMMIT applied before intended crash"
+
+start_normal_ccfs
+
+[[ ! -e "$MOUNT_DIR/$RMDIR_COMMIT_NAME" ]] ||
+    fail "committed RMDIR directory returned after recovery"
+
+grep -q \
+    "replayed: 1" \
+    "$RECOVERY_LOG" ||
+    fail "committed RMDIR did not replay"
+
+stop_ccfs
+
+[[ "$(sql_name_count "$RMDIR_COMMIT_NAME")" == "0" ]] ||
+    fail "recovered RMDIR left metadata"
+
+run_integrity_check
+
+pass "RMDIR killed after COMMIT recovered deletion"
+
+# ============================================================
 # WRITE — AFTER BEGIN
 # ============================================================
 
 echo
-echo "[6/12] WRITE crash after BEGIN..."
+echo "[8/14] WRITE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -567,7 +669,7 @@ pass "WRITE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[7/12] WRITE crash after COMMIT..."
+echo "[9/14] WRITE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -645,7 +747,7 @@ pass "WRITE killed after COMMIT recovered exact data"
 # ============================================================
 
 echo
-echo "[8/12] RENAME crash after BEGIN..."
+echo "[10/14] RENAME crash after BEGIN..."
 
 clear_recovery_state
 
@@ -702,7 +804,7 @@ pass "RENAME killed after BEGIN preserved old namespace"
 # ============================================================
 
 echo
-echo "[9/12] RENAME crash after COMMIT..."
+echo "[11/14] RENAME crash after COMMIT..."
 
 clear_recovery_state
 
@@ -766,7 +868,7 @@ pass "RENAME killed after COMMIT recovered namespace"
 # ============================================================
 
 echo
-echo "[10/12] DELETE crash after BEGIN..."
+echo "[12/14] DELETE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -819,7 +921,7 @@ pass "DELETE killed after BEGIN preserved file"
 # ============================================================
 
 echo
-echo "[11/12] DELETE crash after COMMIT..."
+echo "[13/14] DELETE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -881,7 +983,7 @@ pass "DELETE killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[12/12] Final integrity verification..."
+echo "[14/14] Final integrity verification..."
 
 run_integrity_check
 
