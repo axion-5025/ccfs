@@ -25,6 +25,7 @@ const TTL: Duration = Duration::from_secs(1);
 const NAME_MAX: usize = 255;
 
 const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
+const MKDIR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSMKD1";
 const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
 const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
 const DELETE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSDEL1";
@@ -69,6 +70,17 @@ struct Ccfs {
 
 #[derive(Debug)]
 struct CreateJournalPayload {
+    ino: u64,
+    parent: u64,
+    name: String,
+    perm: u16,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+}
+
+#[derive(Debug)]
+struct MkdirJournalPayload {
     ino: u64,
     parent: u64,
     name: String,
@@ -233,16 +245,22 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
 
 fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     let name_bytes = entry.name.as_bytes();
+
     let mut payload = Vec::new();
 
     payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
     payload.extend_from_slice(&entry.perm.to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.mtime).to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.ctime).to_le_bytes());
+
     payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+
     payload.extend_from_slice(name_bytes);
 
     payload
@@ -266,10 +284,15 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     let mut cursor = CREATE_PAYLOAD_MAGIC.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -308,6 +331,107 @@ fn apply_create_payload(txid: u64, payload: &CreateJournalPayload) -> io::Result
         payload.parent,
         &payload.name,
         false,
+        payload.perm,
+        0,
+        payload.atime,
+        payload.mtime,
+        payload.ctime,
+    )
+    .map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
+ * MKDIR
+ * ============================================================
+ */
+
+fn encode_mkdir_payload(payload: &MkdirJournalPayload) -> Vec<u8> {
+    let name_bytes = payload.name.as_bytes();
+
+    let mut output = Vec::new();
+
+    output.extend_from_slice(MKDIR_PAYLOAD_MAGIC);
+
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+
+    output.extend_from_slice(&payload.parent.to_le_bytes());
+
+    output.extend_from_slice(&payload.perm.to_le_bytes());
+
+    output.extend_from_slice(&payload.atime.to_le_bytes());
+
+    output.extend_from_slice(&payload.mtime.to_le_bytes());
+
+    output.extend_from_slice(&payload.ctime.to_le_bytes());
+
+    output.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+
+    output.extend_from_slice(name_bytes);
+
+    output
+}
+
+fn decode_mkdir_payload(payload: &[u8]) -> io::Result<MkdirJournalPayload> {
+    if payload.len() < MKDIR_PAYLOAD_MAGIC.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MKDIR payload is too short",
+        ));
+    }
+
+    if &payload[..MKDIR_PAYLOAD_MAGIC.len()] != MKDIR_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MKDIR payload magic",
+        ));
+    }
+
+    let mut cursor = MKDIR_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
+    let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
+
+    if payload.len().saturating_sub(cursor) != name_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid MKDIR filename length",
+        ));
+    }
+
+    let name = String::from_utf8(payload[cursor..].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "MKDIR filename invalid UTF-8"))?;
+
+    Ok(MkdirJournalPayload {
+        ino,
+        parent,
+        name,
+        perm,
+        atime,
+        mtime,
+        ctime,
+    })
+}
+
+fn apply_mkdir_payload(txid: u64, payload: &MkdirJournalPayload) -> io::Result<()> {
+    db::save_entry_metadata_with_times_and_mark_tx(
+        txid,
+        payload.ino,
+        payload.parent,
+        &payload.name,
+        true,
         payload.perm,
         0,
         payload.atime,
@@ -869,9 +993,7 @@ fn remove_file_storage_idempotent(ino: u64) -> io::Result<()> {
         match fs::remove_file(&path) {
             Ok(()) => {}
 
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                // Already removed.
-            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
 
             Err(err) => {
                 return Err(err);
@@ -946,6 +1068,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             let payload = decode_create_payload(&transaction.payload)?;
 
             apply_create_payload(transaction.txid, &payload)
+        }
+
+        "MKDIR" => {
+            let payload = decode_mkdir_payload(&transaction.payload)?;
+
+            apply_mkdir_payload(transaction.txid, &payload)
         }
 
         "WRITE" => {
@@ -1660,9 +1788,6 @@ impl Filesystem for Ccfs {
             new_ctime = SystemTime::now();
         }
 
-        /*
-         * A request containing size is a TRUNCATE transaction.
-         */
         if size_requested {
             let payload = TruncateJournalPayload {
                 ino: u64::from(entry.ino),
@@ -1741,9 +1866,6 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        /*
-         * chmod / atime / mtime / ctime changes use SETATTR.
-         */
         if changed {
             let payload = SetattrJournalPayload {
                 ino: u64::from(entry.ino),
@@ -1933,8 +2055,50 @@ impl Filesystem for Ccfs {
 
         let attr = entry_attr(&entry);
 
-        if let Err(err) = persist_entry(&entry) {
-            eprintln!("Failed to persist directory metadata: {}", err);
+        let payload = MkdirJournalPayload {
+            ino: ino_value,
+
+            parent: u64::from(parent),
+
+            name: name.clone(),
+
+            perm: entry.perm,
+
+            atime: system_time_to_timestamp(entry.atime),
+
+            mtime: system_time_to_timestamp(entry.mtime),
+
+            ctime: system_time_to_timestamp(entry.ctime),
+        };
+
+        let encoded_payload = encode_mkdir_payload(&payload);
+
+        let txid = match journal::begin_transaction("MKDIR", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed MKDIR BEGIN: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        maybe_kill9("MKDIR", "after_begin");
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed MKDIR COMMIT: {}", err);
+
+            reply.error(Errno::EIO);
+
+            return;
+        }
+
+        maybe_kill9("MKDIR", "after_commit");
+
+        if let Err(err) = apply_mkdir_payload(txid, &payload) {
+            eprintln!("Committed MKDIR {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
 
