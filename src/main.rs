@@ -22,7 +22,9 @@ use storage::IntegrityStatus;
 
 const TTL: Duration = Duration::from_secs(1);
 const NAME_MAX: usize = 255;
+
 const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
+const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -68,6 +70,18 @@ struct CreateJournalPayload {
     atime: i64,
     mtime: i64,
     ctime: i64,
+}
+
+#[derive(Debug)]
+struct WriteJournalPayload {
+    ino: u64,
+    parent: u64,
+    name: String,
+    perm: u16,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    data: Vec<u8>,
 }
 
 fn database_io_error(error: rusqlite::Error) -> io::Error {
@@ -118,6 +132,28 @@ fn persist_entry(entry: &MemoryEntry) -> rusqlite::Result<()> {
     )
 }
 
+fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<[u8; N]> {
+    if payload.len().saturating_sub(*cursor) < N {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal payload is truncated",
+        ));
+    }
+
+    let mut output = [0u8; N];
+
+    output.copy_from_slice(&payload[*cursor..*cursor + N]);
+
+    *cursor += N;
+
+    Ok(output)
+}
+
+/* ============================================================
+ * CREATE JOURNAL PAYLOAD
+ * ============================================================
+ */
+
 fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     let name_bytes = entry.name.as_bytes();
 
@@ -126,8 +162,11 @@ fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     );
 
     payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
+
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
+
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
+
     payload.extend_from_slice(&entry.perm.to_le_bytes());
 
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
@@ -143,23 +182,6 @@ fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     payload
 }
 
-fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<[u8; N]> {
-    if payload.len().saturating_sub(*cursor) < N {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "journal CREATE payload is truncated",
-        ));
-    }
-
-    let mut output = [0u8; N];
-
-    output.copy_from_slice(&payload[*cursor..*cursor + N]);
-
-    *cursor += N;
-
-    Ok(output)
-}
-
 fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     if payload.len() < CREATE_PAYLOAD_MAGIC.len() {
         return Err(io::Error::new(
@@ -171,7 +193,7 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     if &payload[..CREATE_PAYLOAD_MAGIC.len()] != CREATE_PAYLOAD_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "CREATE journal payload has invalid format",
+            "CREATE journal payload has invalid magic",
         ));
     }
 
@@ -216,17 +238,23 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     })
 }
 
-fn apply_create_payload(payload: &CreateJournalPayload) -> io::Result<()> {
+fn apply_create_payload(txid: u64, payload: &CreateJournalPayload) -> io::Result<()> {
     /*
-     * CREATE replay is deliberately idempotent.
+     * Data block is persisted first.
      *
-     * Rewriting the same empty block produces the same state, and
-     * SQLite save_entry_metadata_with_times() upserts by inode.
+     * If we crash after this point but before SQLite commit,
+     * the committed REDO transaction will simply recreate it.
      */
-
     storage::save_file_data(payload.ino, &[])?;
 
-    db::save_entry_metadata_with_times(
+    /*
+     * Metadata + applied_tx are committed atomically.
+     *
+     * If applied_tx exists, metadata is guaranteed to have
+     * been committed in the same SQLite transaction.
+     */
+    db::save_entry_metadata_with_times_and_mark_tx(
+        txid,
         payload.ino,
         payload.parent,
         &payload.name,
@@ -242,12 +270,193 @@ fn apply_create_payload(payload: &CreateJournalPayload) -> io::Result<()> {
     Ok(())
 }
 
+/* ============================================================
+ * WRITE JOURNAL PAYLOAD
+ * ============================================================
+ */
+
+fn encode_write_payload(payload: &WriteJournalPayload) -> io::Result<Vec<u8>> {
+    let name_bytes = payload.name.as_bytes();
+
+    let name_length = u32::try_from(name_bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WRITE filename too large for journal",
+        )
+    })?;
+
+    let data_length = u64::try_from(payload.data.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WRITE data too large for journal",
+        )
+    })?;
+
+    let mut output = Vec::with_capacity(
+        WRITE_PAYLOAD_MAGIC.len()
+            + 8
+            + 8
+            + 2
+            + 8
+            + 8
+            + 8
+            + 4
+            + 8
+            + name_bytes.len()
+            + payload.data.len(),
+    );
+
+    output.extend_from_slice(WRITE_PAYLOAD_MAGIC);
+
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+
+    output.extend_from_slice(&payload.parent.to_le_bytes());
+
+    output.extend_from_slice(&payload.perm.to_le_bytes());
+
+    output.extend_from_slice(&payload.atime.to_le_bytes());
+
+    output.extend_from_slice(&payload.mtime.to_le_bytes());
+
+    output.extend_from_slice(&payload.ctime.to_le_bytes());
+
+    output.extend_from_slice(&name_length.to_le_bytes());
+
+    output.extend_from_slice(&data_length.to_le_bytes());
+
+    output.extend_from_slice(name_bytes);
+
+    output.extend_from_slice(&payload.data);
+
+    Ok(output)
+}
+
+fn decode_write_payload(payload: &[u8]) -> io::Result<WriteJournalPayload> {
+    if payload.len() < WRITE_PAYLOAD_MAGIC.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal payload is too short",
+        ));
+    }
+
+    if &payload[..WRITE_PAYLOAD_MAGIC.len()] != WRITE_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal payload has invalid magic",
+        ));
+    }
+
+    let mut cursor = WRITE_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
+    let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
+
+    let data_length_u64 = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let data_length = usize::try_from(data_length_u64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal data length does not fit memory",
+        )
+    })?;
+
+    let remaining_length = name_length.checked_add(data_length).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal payload length overflow",
+        )
+    })?;
+
+    if payload.len().saturating_sub(cursor) != remaining_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal payload length is invalid",
+        ));
+    }
+
+    let name_end = cursor + name_length;
+
+    let name = String::from_utf8(payload[cursor..name_end].to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WRITE journal filename is not valid UTF-8",
+        )
+    })?;
+
+    let data = payload[name_end..].to_vec();
+
+    Ok(WriteJournalPayload {
+        ino,
+        parent,
+        name,
+        perm,
+        atime,
+        mtime,
+        ctime,
+        data,
+    })
+}
+
+fn apply_write_payload(txid: u64, payload: &WriteJournalPayload) -> io::Result<()> {
+    /*
+     * The journal stores the COMPLETE final file image.
+     *
+     * Therefore replay does not depend on the old contents.
+     * Running replay multiple times produces identical bytes.
+     */
+    storage::save_file_data(payload.ino, &payload.data)?;
+
+    /*
+     * Metadata and applied_tx are committed atomically.
+     *
+     * applied_tx therefore acts as a reliable idempotency
+     * marker for this WRITE transaction.
+     */
+    db::save_entry_metadata_with_times_and_mark_tx(
+        txid,
+        payload.ino,
+        payload.parent,
+        &payload.name,
+        false,
+        payload.perm,
+        payload.data.len() as u64,
+        payload.atime,
+        payload.mtime,
+        payload.ctime,
+    )
+    .map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
+ * STARTUP RECOVERY
+ * ============================================================
+ */
+
 fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
     recovery::recover_with(|transaction| match transaction.operation.as_str() {
         "CREATE" => {
             let payload = decode_create_payload(&transaction.payload)?;
 
-            apply_create_payload(&payload)
+            apply_create_payload(transaction.txid, &payload)
+        }
+
+        "WRITE" => {
+            let payload = decode_write_payload(&transaction.payload)?;
+
+            apply_write_payload(transaction.txid, &payload)
         }
 
         other => Err(io::Error::new(
@@ -257,9 +466,15 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
     })
 }
 
+/* ============================================================
+ * FILESYSTEM STATE LOADING
+ * ============================================================
+ */
+
 impl Ccfs {
     fn new() -> Self {
         let mut entries = BTreeMap::new();
+
         let now = SystemTime::now();
 
         entries.insert(
@@ -329,13 +544,21 @@ impl Ccfs {
                         meta.ino,
                         MemoryEntry {
                             ino: INodeNo(meta.ino),
+
                             parent: INodeNo(meta.parent),
+
                             name: meta.name,
+
                             is_dir: meta.is_dir,
+
                             data,
+
                             perm: meta.perm,
+
                             atime: timestamp_to_system_time(meta.atime),
+
                             mtime: timestamp_to_system_time(meta.mtime),
+
                             ctime: timestamp_to_system_time(meta.ctime),
                         },
                     );
@@ -352,6 +575,11 @@ impl Ccfs {
         }
     }
 }
+
+/* ============================================================
+ * ATTRIBUTE HELPERS
+ * ============================================================
+ */
 
 fn root_attr() -> FileAttr {
     FileAttr {
@@ -392,13 +620,21 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
         ino: entry.ino,
         size,
         blocks: (size + 511) / 512,
+
         atime: entry.atime,
+
         mtime: entry.mtime,
+
         ctime: entry.ctime,
+
         crtime: entry.ctime,
+
         kind: entry_kind(entry),
+
         perm: entry.perm,
+
         nlink: if entry.is_dir { 2 } else { 1 },
+
         uid: 1000,
         gid: 1000,
         rdev: 0,
@@ -414,7 +650,9 @@ fn check_directory(state: &State, ino: INodeNo) -> Result<(), Errno> {
 
     match state.entries.get(&u64::from(ino)) {
         Some(entry) if entry.is_dir => Ok(()),
+
         Some(_) => Err(Errno::ENOTDIR),
+
         None => Err(Errno::ENOENT),
     }
 }
@@ -429,6 +667,7 @@ fn find_child(state: &State, parent: INodeNo, name: &str) -> Option<u64> {
 
 fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INodeNo) -> bool {
     let mut current = new_parent;
+
     let mut steps = 0usize;
 
     while current != INodeNo::ROOT {
@@ -443,6 +682,7 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
         };
 
         current = entry.parent;
+
         steps += 1;
 
         if steps > state.entries.len() {
@@ -452,6 +692,11 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
 
     false
 }
+
+/* ============================================================
+ * CHECKSUM / INTEGRITY COMMANDS
+ * ============================================================
+ */
 
 fn migrate_checksums() {
     let _db = match db::init_database() {
@@ -465,6 +710,7 @@ fn migrate_checksums() {
     };
 
     println!("CCFS checksum migration");
+
     println!("-----------------------");
 
     let entries = match db::load_entries() {
@@ -478,6 +724,7 @@ fn migrate_checksums() {
     };
 
     let mut repaired_empty_files = 0usize;
+
     let mut unrecoverable_missing_blocks = 0usize;
 
     for entry in entries {
@@ -546,6 +793,7 @@ fn migrate_checksums() {
     };
 
     println!();
+
     println!("Migration completed.");
 
     println!("Legacy empty blocks repaired: {}", repaired_empty_files);
@@ -565,6 +813,7 @@ fn check_integrity() {
     };
 
     println!("CCFS integrity check");
+
     println!("--------------------");
 
     let entries = match db::load_entries() {
@@ -578,6 +827,7 @@ fn check_integrity() {
     };
 
     let mut failures = 0usize;
+
     let mut regular_file_inodes = BTreeSet::new();
 
     for entry in entries {
@@ -614,8 +864,7 @@ fn check_integrity() {
                 failures += 1;
 
                 println!(
-                    "[FAIL] inode {}: {} checksum mismatch \
-                     expected={:016x} actual={:016x}",
+                    "[FAIL] inode {}: {} checksum mismatch expected={:016x} actual={:016x}",
                     entry.ino, entry.name, expected, actual
                 );
             }
@@ -706,16 +955,26 @@ fn print_usage() {
     println!("Commands:");
 
     println!("  --migrate-checksums");
+
     println!("      Repair legacy empty-file blocks and create missing checksums.");
+
     println!();
 
     println!("  --check-integrity");
+
     println!("      Compare SQLite metadata, data blocks and stored checksums.");
+
     println!();
 
     println!("  --recovery-status");
+
     println!("      Show journal and applied transaction recovery state.");
 }
+
+/* ============================================================
+ * FUSE FILESYSTEM
+ * ============================================================
+ */
 
 impl Filesystem for Ccfs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -735,11 +994,13 @@ impl Filesystem for Ccfs {
 
         let Some(ino) = find_child(&state, parent, name.as_ref()) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         let Some(entry) = state.entries.get(&ino) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
@@ -749,6 +1010,7 @@ impl Filesystem for Ccfs {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == INodeNo::ROOT {
             reply.attr(&TTL, &root_attr());
+
             return;
         }
 
@@ -756,6 +1018,7 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
@@ -782,6 +1045,7 @@ impl Filesystem for Ccfs {
     ) {
         if ino == INodeNo::ROOT {
             reply.attr(&TTL, &root_attr());
+
             return;
         }
 
@@ -789,10 +1053,12 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         let mut changed = false;
+
         let mut change_ctime = false;
 
         if let Some(mode) = mode {
@@ -805,6 +1071,7 @@ impl Filesystem for Ccfs {
         if let Some(size) = size {
             if entry.is_dir {
                 reply.error(Errno::EISDIR);
+
                 return;
             }
 
@@ -821,6 +1088,7 @@ impl Filesystem for Ccfs {
                 eprintln!("Failed to persist resized file: {}", err);
 
                 reply.error(Errno::EIO);
+
                 return;
             }
         }
@@ -842,6 +1110,7 @@ impl Filesystem for Ccfs {
 
         if let Some(value) = ctime {
             entry.ctime = value;
+
             changed = true;
         }
 
@@ -854,6 +1123,7 @@ impl Filesystem for Ccfs {
                 eprintln!("Failed to update metadata: {}", err);
 
                 reply.error(Errno::EIO);
+
                 return;
             }
         }
@@ -937,6 +1207,7 @@ impl Filesystem for Ccfs {
 
         if find_child(&state, parent, &name).is_some() {
             reply.error(Errno::EEXIST);
+
             return;
         }
 
@@ -948,13 +1219,21 @@ impl Filesystem for Ccfs {
 
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
+
             parent,
+
             name: name.clone(),
+
             is_dir: true,
+
             data: Vec::new(),
+
             perm: (mode & !umask & 0o777) as u16,
+
             atime: now,
+
             mtime: now,
+
             ctime: now,
         };
 
@@ -964,6 +1243,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to persist directory metadata: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -998,6 +1278,7 @@ impl Filesystem for Ccfs {
 
         if find_child(&state, parent, &name).is_some() {
             reply.error(Errno::EEXIST);
+
             return;
         }
 
@@ -1009,41 +1290,45 @@ impl Filesystem for Ccfs {
 
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
+
             parent,
+
             name: name.clone(),
+
             is_dir: false,
+
             data: Vec::new(),
+
             perm: (mode & !umask & 0o777) as u16,
+
             atime: now,
+
             mtime: now,
+
             ctime: now,
         };
 
         let attr = entry_attr(&entry);
 
         /*
-         * REDO journal ordering:
+         * REDO CREATE:
          *
-         * 1. BEGIN + full intended CREATE payload
-         * 2. fsync journal
-         * 3. COMMIT
-         * 4. fsync journal
-         * 5. Apply data + metadata
-         * 6. Mark transaction applied
-         *
-         * A crash before COMMIT means recovery ignores the tx.
-         * A crash after COMMIT means recovery replays CREATE.
+         * BEGIN -> fsync
+         * COMMIT -> fsync
+         * apply block
+         * metadata + applied_tx atomic commit
          */
 
-        let payload = encode_create_payload(&entry);
+        let journal_payload = encode_create_payload(&entry);
 
-        let txid = match journal::begin_transaction("CREATE", &payload) {
+        let txid = match journal::begin_transaction("CREATE", &journal_payload) {
             Ok(txid) => txid,
 
             Err(err) => {
                 eprintln!("Failed to write CREATE BEGIN record: {}", err);
 
                 reply.error(Errno::EIO);
+
                 return;
             }
         };
@@ -1051,51 +1336,36 @@ impl Filesystem for Ccfs {
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed to write CREATE COMMIT record: {}", err);
 
-            /*
-             * BEGIN remains incomplete.
-             * Recovery will ignore it.
-             */
-
             reply.error(Errno::EIO);
+
             return;
         }
 
-        let replay_payload = CreateJournalPayload {
+        let create_payload = CreateJournalPayload {
             ino: ino_value,
+
             parent: u64::from(parent),
+
             name: name.clone(),
+
             perm: entry.perm,
+
             atime: system_time_to_timestamp(entry.atime),
+
             mtime: system_time_to_timestamp(entry.mtime),
+
             ctime: system_time_to_timestamp(entry.ctime),
         };
 
-        if let Err(err) = apply_create_payload(&replay_payload) {
-            /*
-             * Transaction is committed but not fully applied.
-             * Do not mark it applied.
-             *
-             * Startup recovery will retry it.
-             */
+        if let Err(err) = apply_create_payload(txid, &create_payload) {
             eprintln!(
                 "Committed CREATE transaction {} could not be applied: {}",
                 txid, err
             );
 
             reply.error(Errno::EIO);
-            return;
-        }
 
-        /*
-         * applied_tx is an optimization/idempotency marker.
-         * If this marker write fails, the operation itself is still
-         * durable and replay-safe. A later restart may replay it once.
-         */
-        if let Err(err) = recovery::mark_transaction_applied(txid) {
-            eprintln!(
-                "Warning: CREATE transaction {} applied but applied_tx marker failed: {}",
-                txid, err
-            );
+            return;
         }
 
         state.entries.insert(ino_value, entry);
@@ -1126,21 +1396,25 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &name) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if ino_value == 2 {
             reply.error(Errno::EPERM);
+
             return;
         }
 
         let Some(entry) = state.entries.get(&ino_value) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
+
             return;
         }
 
@@ -1148,6 +1422,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to delete file contents: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -1155,6 +1430,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to delete file metadata: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -1180,16 +1456,19 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &name) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         let Some(entry) = state.entries.get(&ino_value) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if !entry.is_dir {
             reply.error(Errno::ENOTDIR);
+
             return;
         }
 
@@ -1201,6 +1480,7 @@ impl Filesystem for Ccfs {
             .any(|child| child.parent == directory_ino)
         {
             reply.error(Errno::ENOTEMPTY);
+
             return;
         }
 
@@ -1208,6 +1488,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to delete directory metadata: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -1238,6 +1519,7 @@ impl Filesystem for Ccfs {
 
         if !flags.is_empty() {
             reply.error(Errno::EINVAL);
+
             return;
         }
 
@@ -1259,11 +1541,13 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &old_name) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if ino_value == 2 {
             reply.error(Errno::EPERM);
+
             return;
         }
 
@@ -1274,6 +1558,7 @@ impl Filesystem for Ccfs {
 
         if find_child(&state, newparent, &new_name).is_some() {
             reply.error(Errno::EEXIST);
+
             return;
         }
 
@@ -1285,11 +1570,13 @@ impl Filesystem for Ccfs {
 
         if is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
             reply.error(Errno::EINVAL);
+
             return;
         }
 
         let Some(entry) = state.entries.get_mut(&ino_value) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
@@ -1315,6 +1602,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to persist rename: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -1336,11 +1624,13 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
+
             return;
         }
 
@@ -1350,6 +1640,7 @@ impl Filesystem for Ccfs {
             eprintln!("Failed to persist access time: {}", err);
 
             reply.error(Errno::EIO);
+
             return;
         }
 
@@ -1357,6 +1648,7 @@ impl Filesystem for Ccfs {
 
         if start >= entry.data.len() {
             reply.data(&[]);
+
             return;
         }
 
@@ -1381,46 +1673,142 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
+
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
+
             return;
         }
 
-        let start = offset as usize;
+        let start = match usize::try_from(offset) {
+            Ok(start) => start,
 
-        let end = start + data.len();
+            Err(_) => {
+                reply.error(Errno::EFBIG);
 
-        if entry.data.len() < start {
-            entry.data.resize(start, 0);
+                return;
+            }
+        };
+
+        let end = match start.checked_add(data.len()) {
+            Some(end) => end,
+
+            None => {
+                reply.error(Errno::EFBIG);
+
+                return;
+            }
+        };
+
+        /*
+         * Build the complete FINAL file image in memory first.
+         *
+         * We do not mutate the live MemoryEntry until the
+         * committed transaction has been applied successfully.
+         */
+        let mut final_data = entry.data.clone();
+
+        if final_data.len() < start {
+            final_data.resize(start, 0);
         }
 
-        if entry.data.len() < end {
-            entry.data.resize(end, 0);
+        if final_data.len() < end {
+            final_data.resize(end, 0);
         }
 
-        entry.data[start..end].copy_from_slice(data);
+        final_data[start..end].copy_from_slice(data);
 
         let now = SystemTime::now();
 
+        let write_payload = WriteJournalPayload {
+            ino: u64::from(entry.ino),
+
+            parent: u64::from(entry.parent),
+
+            name: entry.name.clone(),
+
+            perm: entry.perm,
+
+            atime: system_time_to_timestamp(entry.atime),
+
+            mtime: system_time_to_timestamp(now),
+
+            ctime: system_time_to_timestamp(now),
+
+            data: final_data.clone(),
+        };
+
+        let encoded_payload = match encode_write_payload(&write_payload) {
+            Ok(payload) => payload,
+
+            Err(err) => {
+                eprintln!("Failed to encode WRITE journal payload: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        /*
+         * REDO WRITE:
+         *
+         * 1. BEGIN contains COMPLETE final file image
+         * 2. BEGIN fsync
+         * 3. COMMIT
+         * 4. COMMIT fsync
+         * 5. write data + checksum
+         * 6. metadata + applied_tx atomic SQLite transaction
+         */
+
+        let txid = match journal::begin_transaction("WRITE", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed to write WRITE BEGIN record: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed to write WRITE COMMIT record: {}", err);
+
+            reply.error(Errno::EIO);
+
+            return;
+        }
+
+        if let Err(err) = apply_write_payload(txid, &write_payload) {
+            /*
+             * COMMIT is already durable.
+             *
+             * Do NOT mark the transaction applied manually.
+             * Startup recovery will replay the complete final image.
+             */
+            eprintln!(
+                "Committed WRITE transaction {} could not be applied: {}",
+                txid, err
+            );
+
+            reply.error(Errno::EIO);
+
+            return;
+        }
+
+        /*
+         * Only now update live in-memory state.
+         */
+        entry.data = final_data;
+
         entry.mtime = now;
+
         entry.ctime = now;
-
-        if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
-            eprintln!("Failed to persist file contents: {}", err);
-
-            reply.error(Errno::EIO);
-            return;
-        }
-
-        if let Err(err) = persist_entry(entry) {
-            eprintln!("Failed to update file metadata: {}", err);
-
-            reply.error(Errno::EIO);
-            return;
-        }
 
         reply.written(data.len() as u32);
     }
@@ -1447,6 +1835,11 @@ impl Filesystem for Ccfs {
         reply.ok();
     }
 }
+
+/* ============================================================
+ * MAIN
+ * ============================================================
+ */
 
 fn main() {
     let args: Vec<String> = env::args().collect();
