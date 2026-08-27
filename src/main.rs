@@ -28,6 +28,7 @@ const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
 const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
 const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
 const DELETE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSDEL1";
+const RMDIR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSRMD1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -105,6 +106,11 @@ struct DeleteJournalPayload {
     ino: u64,
 }
 
+#[derive(Debug)]
+struct RmdirJournalPayload {
+    ino: u64,
+}
+
 fn database_io_error(error: rusqlite::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::Other,
@@ -133,16 +139,6 @@ fn resolve_time(value: TimeOrNow) -> SystemTime {
     }
 }
 
-/*
- * Test-only deterministic SIGKILL failpoint.
- *
- * Example:
- *
- * CCFS_KILL9_OPERATION=WRITE
- * CCFS_KILL9_POINT=after_commit
- *
- * This is inactive during normal execution.
- */
 fn maybe_kill9(operation: &str, point: &str) {
     let configured_operation = env::var("CCFS_KILL9_OPERATION").ok();
 
@@ -205,7 +201,7 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
 }
 
 /* ============================================================
- * CREATE JOURNAL
+ * CREATE
  * ============================================================
  */
 
@@ -215,21 +211,13 @@ fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     let mut payload = Vec::new();
 
     payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
-
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
-
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
-
     payload.extend_from_slice(&entry.perm.to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.mtime).to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.ctime).to_le_bytes());
-
     payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-
     payload.extend_from_slice(name_bytes);
 
     payload
@@ -312,7 +300,7 @@ fn apply_create_payload(txid: u64, payload: &CreateJournalPayload) -> io::Result
 }
 
 /* ============================================================
- * WRITE JOURNAL
+ * WRITE
  * ============================================================
  */
 
@@ -439,7 +427,7 @@ fn apply_write_payload(txid: u64, payload: &WriteJournalPayload) -> io::Result<(
 }
 
 /* ============================================================
- * RENAME JOURNAL
+ * RENAME
  * ============================================================
  */
 
@@ -563,7 +551,7 @@ fn apply_rename_payload(txid: u64, payload: &RenameJournalPayload) -> io::Result
 }
 
 /* ============================================================
- * DELETE JOURNAL
+ * DELETE
  * ============================================================
  */
 
@@ -633,6 +621,51 @@ fn apply_delete_payload(txid: u64, payload: &DeleteJournalPayload) -> io::Result
 }
 
 /* ============================================================
+ * RMDIR
+ * ============================================================
+ */
+
+fn encode_rmdir_payload(payload: &RmdirJournalPayload) -> Vec<u8> {
+    let mut output = Vec::with_capacity(RMDIR_PAYLOAD_MAGIC.len() + 8);
+
+    output.extend_from_slice(RMDIR_PAYLOAD_MAGIC);
+
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+
+    output
+}
+
+fn decode_rmdir_payload(payload: &[u8]) -> io::Result<RmdirJournalPayload> {
+    let expected_length = RMDIR_PAYLOAD_MAGIC.len() + 8;
+
+    if payload.len() != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RMDIR payload has invalid length",
+        ));
+    }
+
+    if &payload[..RMDIR_PAYLOAD_MAGIC.len()] != RMDIR_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid RMDIR payload magic",
+        ));
+    }
+
+    let mut cursor = RMDIR_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    Ok(RmdirJournalPayload { ino })
+}
+
+fn apply_rmdir_payload(txid: u64, payload: &RmdirJournalPayload) -> io::Result<()> {
+    db::delete_entry_metadata_and_mark_tx(txid, payload.ino).map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
  * STARTUP RECOVERY
  * ============================================================
  */
@@ -661,6 +694,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             let payload = decode_delete_payload(&transaction.payload)?;
 
             apply_delete_payload(transaction.txid, &payload)
+        }
+
+        "RMDIR" => {
+            let payload = decode_rmdir_payload(&transaction.payload)?;
+
+            apply_rmdir_payload(transaction.txid, &payload)
         }
 
         other => Err(io::Error::new(
@@ -791,33 +830,19 @@ impl Ccfs {
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: INodeNo::ROOT,
-
         size: 0,
-
         blocks: 0,
-
         atime: UNIX_EPOCH,
-
         mtime: UNIX_EPOCH,
-
         ctime: UNIX_EPOCH,
-
         crtime: UNIX_EPOCH,
-
         kind: FileType::Directory,
-
         perm: 0o755,
-
         nlink: 2,
-
         uid: 1000,
-
         gid: 1000,
-
         rdev: 0,
-
         blksize: 4096,
-
         flags: 0,
     }
 }
@@ -839,33 +864,19 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
 
     FileAttr {
         ino: entry.ino,
-
         size,
-
         blocks: (size + 511) / 512,
-
         atime: entry.atime,
-
         mtime: entry.mtime,
-
         ctime: entry.ctime,
-
         crtime: entry.ctime,
-
         kind: entry_kind(entry),
-
         perm: entry.perm,
-
         nlink: if entry.is_dir { 2 } else { 1 },
-
         uid: 1000,
-
         gid: 1000,
-
         rdev: 0,
-
         blksize: 4096,
-
         flags: 0,
     }
 }
@@ -1707,8 +1718,36 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        if let Err(err) = db::delete_entry_metadata(ino_value) {
-            eprintln!("Failed directory metadata delete: {}", err);
+        let payload = RmdirJournalPayload { ino: ino_value };
+
+        let encoded_payload = encode_rmdir_payload(&payload);
+
+        let txid = match journal::begin_transaction("RMDIR", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed RMDIR BEGIN: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        maybe_kill9("RMDIR", "after_begin");
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed RMDIR COMMIT: {}", err);
+
+            reply.error(Errno::EIO);
+
+            return;
+        }
+
+        maybe_kill9("RMDIR", "after_commit");
+
+        if let Err(err) = apply_rmdir_payload(txid, &payload) {
+            eprintln!("Committed RMDIR {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
 
