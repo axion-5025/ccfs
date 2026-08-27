@@ -28,6 +28,9 @@ RMDIR_COMMIT_NAME="k9-rmdir-commit-$RUN_ID"
 WRITE_BEGIN_NAME="k9-write-begin-$RUN_ID.txt"
 WRITE_COMMIT_NAME="k9-write-commit-$RUN_ID.txt"
 
+TRUNCATE_BEGIN_NAME="k9-truncate-begin-$RUN_ID.txt"
+TRUNCATE_COMMIT_NAME="k9-truncate-commit-$RUN_ID.txt"
+
 RENAME_BEGIN_OLD="k9-rename-begin-old-$RUN_ID.txt"
 RENAME_BEGIN_NEW="k9-rename-begin-new-$RUN_ID.txt"
 
@@ -39,6 +42,9 @@ DELETE_COMMIT_NAME="k9-delete-commit-$RUN_ID.txt"
 
 WRITE_BEGIN_INO=""
 WRITE_COMMIT_INO=""
+
+TRUNCATE_BEGIN_INO=""
+TRUNCATE_COMMIT_INO=""
 
 RENAME_BEGIN_INO=""
 RENAME_COMMIT_INO=""
@@ -187,8 +193,10 @@ wait_for_sigkill() {
     fi
 
     set +e
+
     wait "$pid" 2>/dev/null
     local status=$?
+
     set -e
 
     CCFS_PID=""
@@ -326,7 +334,7 @@ echo " CCFS REAL SIGKILL Recovery Test Suite"
 echo "========================================"
 echo
 
-echo "[1/14] Snapshotting original volume and building CCFS..."
+echo "[1/16] Snapshotting original volume and building CCFS..."
 
 snapshot_volume
 
@@ -343,7 +351,7 @@ pass "volume snapshot created and CCFS built"
 # ============================================================
 
 echo
-echo "[2/14] CREATE crash after BEGIN..."
+echo "[2/16] CREATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -379,7 +387,7 @@ pass "CREATE killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[3/14] CREATE crash after COMMIT..."
+echo "[3/16] CREATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -417,7 +425,7 @@ pass "CREATE killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[4/14] MKDIR crash after BEGIN..."
+echo "[4/16] MKDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -453,7 +461,7 @@ pass "MKDIR killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[5/14] MKDIR crash after COMMIT..."
+echo "[5/16] MKDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -494,7 +502,7 @@ pass "MKDIR killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[6/14] RMDIR crash after BEGIN..."
+echo "[6/16] RMDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -541,7 +549,7 @@ pass "RMDIR killed after BEGIN preserved directory"
 # ============================================================
 
 echo
-echo "[7/14] RMDIR crash after COMMIT..."
+echo "[7/16] RMDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -593,7 +601,7 @@ pass "RMDIR killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[8/14] WRITE crash after BEGIN..."
+echo "[8/16] WRITE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -669,7 +677,7 @@ pass "WRITE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[9/14] WRITE crash after COMMIT..."
+echo "[9/16] WRITE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -743,11 +751,143 @@ run_integrity_check
 pass "WRITE killed after COMMIT recovered exact data"
 
 # ============================================================
+# TRUNCATE — AFTER BEGIN
+# ============================================================
+
+echo
+echo "[10/16] TRUNCATE crash after BEGIN..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "TRUNCATE-BEGIN-DATA" \
+    > "$MOUNT_DIR/$TRUNCATE_BEGIN_NAME"
+
+TRUNCATE_BEGIN_INO="$(
+    stat -c '%i' \
+        "$MOUNT_DIR/$TRUNCATE_BEGIN_NAME"
+)"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "TRUNCATE" \
+    "after_begin"
+
+timeout 5 python3 - \
+    "$MOUNT_DIR/$TRUNCATE_BEGIN_NAME" \
+    2>/dev/null <<'PY' || true
+import os
+import sys
+
+path = sys.argv[1]
+
+os.truncate(
+    path,
+    8,
+)
+PY
+
+wait_for_sigkill
+
+assert_block_text \
+    "$TRUNCATE_BEGIN_INO" \
+    "TRUNCATE-BEGIN-DATA" ||
+    fail "TRUNCATE-after-BEGIN changed durable data"
+
+start_normal_ccfs
+
+assert_file_text \
+    "$MOUNT_DIR/$TRUNCATE_BEGIN_NAME" \
+    "TRUNCATE-BEGIN-DATA" ||
+    fail "incomplete TRUNCATE changed file after restart"
+
+grep -q \
+    "incomplete ignored: 1" \
+    "$RECOVERY_LOG" ||
+    fail "TRUNCATE-after-BEGIN was not classified incomplete"
+
+stop_ccfs
+
+run_integrity_check
+
+pass "TRUNCATE killed after BEGIN preserved old data"
+
+# ============================================================
+# TRUNCATE — AFTER COMMIT
+# ============================================================
+
+echo
+echo "[11/16] TRUNCATE crash after COMMIT..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "TRUNCATE-COMMIT-DATA" \
+    > "$MOUNT_DIR/$TRUNCATE_COMMIT_NAME"
+
+TRUNCATE_COMMIT_INO="$(
+    stat -c '%i' \
+        "$MOUNT_DIR/$TRUNCATE_COMMIT_NAME"
+)"
+
+stop_ccfs
+
+clear_recovery_state
+
+start_crash_ccfs \
+    "TRUNCATE" \
+    "after_commit"
+
+timeout 5 python3 - \
+    "$MOUNT_DIR/$TRUNCATE_COMMIT_NAME" \
+    2>/dev/null <<'PY' || true
+import os
+import sys
+
+path = sys.argv[1]
+
+os.truncate(
+    path,
+    8,
+)
+PY
+
+wait_for_sigkill
+
+assert_block_text \
+    "$TRUNCATE_COMMIT_INO" \
+    "TRUNCATE-COMMIT-DATA" ||
+    fail "TRUNCATE-after-COMMIT applied before intended crash"
+
+start_normal_ccfs
+
+assert_file_text \
+    "$MOUNT_DIR/$TRUNCATE_COMMIT_NAME" \
+    "TRUNCATE" ||
+    fail "committed TRUNCATE was not recovered"
+
+grep -q \
+    "replayed: 1" \
+    "$RECOVERY_LOG" ||
+    fail "committed TRUNCATE did not replay"
+
+stop_ccfs
+
+run_integrity_check
+
+pass "TRUNCATE killed after COMMIT recovered exact size and data"
+
+# ============================================================
 # RENAME — AFTER BEGIN
 # ============================================================
 
 echo
-echo "[10/14] RENAME crash after BEGIN..."
+echo "[12/16] RENAME crash after BEGIN..."
 
 clear_recovery_state
 
@@ -804,7 +944,7 @@ pass "RENAME killed after BEGIN preserved old namespace"
 # ============================================================
 
 echo
-echo "[11/14] RENAME crash after COMMIT..."
+echo "[13/16] RENAME crash after COMMIT..."
 
 clear_recovery_state
 
@@ -868,7 +1008,7 @@ pass "RENAME killed after COMMIT recovered namespace"
 # ============================================================
 
 echo
-echo "[12/14] DELETE crash after BEGIN..."
+echo "[14/16] DELETE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -921,7 +1061,7 @@ pass "DELETE killed after BEGIN preserved file"
 # ============================================================
 
 echo
-echo "[13/14] DELETE crash after COMMIT..."
+echo "[15/16] DELETE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -983,7 +1123,7 @@ pass "DELETE killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[14/14] Final integrity verification..."
+echo "[16/16] Final integrity verification..."
 
 run_integrity_check
 
