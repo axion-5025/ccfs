@@ -8,8 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -309,7 +309,6 @@ impl Filesystem for Ccfs {
 
         let name = name.to_string_lossy().into_owned();
 
-        // hello.txt is a built-in demo file created on every startup.
         if name == "hello.txt" {
             reply.error(Errno::EPERM);
             return;
@@ -335,6 +334,76 @@ impl Filesystem for Ccfs {
         }
 
         state.files.remove(&name);
+
+        reply.ok();
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if parent != INodeNo::ROOT || newparent != INodeNo::ROOT {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        // Current milestone supports normal rename only.
+        if !flags.is_empty() {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+
+        let old_name = name.to_string_lossy().into_owned();
+        let new_name = newname.to_string_lossy().into_owned();
+
+        if old_name == "hello.txt" {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
+        if old_name == new_name {
+            reply.ok();
+            return;
+        }
+
+        let mut state = self.state.lock().unwrap();
+
+        if !state.files.contains_key(&old_name) {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+
+        // For now we do not overwrite an existing destination file.
+        if state.files.contains_key(&new_name) {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        let Some(mut file) = state.files.remove(&old_name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let ino = file.ino;
+
+        if let Err(err) = db::rename_file_metadata(u64::from(ino), &new_name) {
+            eprintln!("Failed to rename file metadata: {}", err);
+
+            // Roll back the in-memory removal.
+            state.files.insert(old_name, file);
+
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        file.name = new_name.clone();
+        state.files.insert(new_name, file);
 
         reply.ok();
     }

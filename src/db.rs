@@ -18,6 +18,7 @@ pub fn init_database() -> Result<Connection> {
 
     Ok(conn)
 }
+
 pub fn save_file_metadata(ino: u64, name: &str, perm: u16, size: u64) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
 
@@ -31,6 +32,7 @@ pub fn save_file_metadata(ino: u64, name: &str, perm: u16, size: u64) -> Result<
 
     Ok(())
 }
+
 #[derive(Debug)]
 pub struct FileMetadata {
     pub ino: u64,
@@ -67,12 +69,28 @@ pub fn load_file_metadata() -> Result<Vec<FileMetadata>> {
 
     Ok(files)
 }
+
 pub fn delete_file_metadata(ino: u64) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
 
     conn.execute(
         "DELETE FROM files WHERE ino = ?1",
         rusqlite::params![ino as i64],
+    )?;
+
+    Ok(())
+}
+
+pub fn rename_file_metadata(ino: u64, new_name: &str) -> Result<()> {
+    let conn = Connection::open("volume/metadata.db")?;
+
+    conn.execute(
+        "
+        UPDATE files
+        SET name = ?1
+        WHERE ino = ?2
+        ",
+        rusqlite::params![new_name, ino as i64],
     )?;
 
     Ok(())
