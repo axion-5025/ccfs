@@ -1,5 +1,15 @@
 use rusqlite::{Connection, Result};
 
+#[derive(Debug)]
+pub struct EntryMetadata {
+    pub ino: u64,
+    pub parent: u64,
+    pub name: String,
+    pub is_dir: bool,
+    pub perm: u16,
+    pub size: u64,
+}
+
 pub fn init_database() -> Result<Connection> {
     let conn = Connection::open("volume/metadata.db")?;
 
@@ -7,90 +17,156 @@ pub fn init_database() -> Result<Connection> {
 
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS files (
+        CREATE TABLE IF NOT EXISTS entries (
             ino INTEGER PRIMARY KEY,
-            name TEXT UNIQUE NOT NULL,
+            parent INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kind INTEGER NOT NULL,
             perm INTEGER NOT NULL,
-            size INTEGER NOT NULL DEFAULT 0
+            size INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(parent, name)
         );
+
+        CREATE INDEX IF NOT EXISTS idx_entries_parent
+        ON entries(parent);
         ",
     )?;
+
+    let old_table_exists: i64 = conn.query_row(
+        "
+        SELECT EXISTS(
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name = 'files'
+        )
+        ",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if old_table_exists != 0 {
+        conn.execute_batch(
+            "
+            INSERT OR IGNORE INTO entries
+                (ino, parent, name, kind, perm, size)
+            SELECT
+                ino,
+                1,
+                name,
+                0,
+                perm,
+                size
+            FROM files;
+
+            DROP TABLE files;
+            ",
+        )?;
+    }
 
     Ok(conn)
 }
 
-pub fn save_file_metadata(ino: u64, name: &str, perm: u16, size: u64) -> Result<()> {
+pub fn save_entry_metadata(
+    ino: u64,
+    parent: u64,
+    name: &str,
+    is_dir: bool,
+    perm: u16,
+    size: u64,
+) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
+
+    let kind = if is_dir { 1i64 } else { 0i64 };
 
     conn.execute(
         "
-        INSERT OR REPLACE INTO files (ino, name, perm, size)
-        VALUES (?1, ?2, ?3, ?4)
+        INSERT INTO entries
+            (ino, parent, name, kind, perm, size)
+        VALUES
+            (?1, ?2, ?3, ?4, ?5, ?6)
+
+        ON CONFLICT(ino) DO UPDATE SET
+            parent = excluded.parent,
+            name   = excluded.name,
+            kind   = excluded.kind,
+            perm   = excluded.perm,
+            size   = excluded.size
         ",
-        rusqlite::params![ino as i64, name, perm, size as i64],
+        rusqlite::params![
+            ino as i64,
+            parent as i64,
+            name,
+            kind,
+            perm as i64,
+            size as i64,
+        ],
     )?;
 
     Ok(())
 }
 
-#[derive(Debug)]
-pub struct FileMetadata {
-    pub ino: u64,
-    pub name: String,
-    pub perm: u16,
-    pub size: u64,
-}
-
-pub fn load_file_metadata() -> Result<Vec<FileMetadata>> {
+pub fn load_entries() -> Result<Vec<EntryMetadata>> {
     let conn = Connection::open("volume/metadata.db")?;
 
     let mut stmt = conn.prepare(
         "
-        SELECT ino, name, perm, size
-        FROM files
+        SELECT
+            ino,
+            parent,
+            name,
+            kind,
+            perm,
+            size
+        FROM entries
         ORDER BY ino
         ",
     )?;
 
     let rows = stmt.query_map([], |row| {
-        Ok(FileMetadata {
+        let kind: i64 = row.get(3)?;
+
+        Ok(EntryMetadata {
             ino: row.get::<_, i64>(0)? as u64,
-            name: row.get(1)?,
-            perm: row.get::<_, i64>(2)? as u16,
-            size: row.get::<_, i64>(3)? as u64,
+            parent: row.get::<_, i64>(1)? as u64,
+            name: row.get(2)?,
+            is_dir: kind != 0,
+            perm: row.get::<_, i64>(4)? as u16,
+            size: row.get::<_, i64>(5)? as u64,
         })
     })?;
 
-    let mut files = Vec::new();
+    let mut entries = Vec::new();
 
     for row in rows {
-        files.push(row?);
+        entries.push(row?);
     }
 
-    Ok(files)
+    Ok(entries)
 }
 
-pub fn delete_file_metadata(ino: u64) -> Result<()> {
+pub fn delete_entry_metadata(ino: u64) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
 
     conn.execute(
-        "DELETE FROM files WHERE ino = ?1",
+        "DELETE FROM entries WHERE ino = ?1",
         rusqlite::params![ino as i64],
     )?;
 
     Ok(())
 }
 
-pub fn rename_file_metadata(ino: u64, new_name: &str) -> Result<()> {
+pub fn rename_entry_metadata(ino: u64, new_parent: u64, new_name: &str) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
 
     conn.execute(
         "
-        UPDATE files
-        SET name = ?1
-        WHERE ino = ?2
+        UPDATE entries
+        SET parent = ?1,
+            name = ?2
+        WHERE ino = ?3
         ",
-        rusqlite::params![new_name, ino as i64],
+        rusqlite::params![new_parent as i64, new_name, ino as i64,],
     )?;
 
     Ok(())

@@ -14,15 +14,17 @@ use fuser::{
 
 const TTL: Duration = Duration::from_secs(1);
 
-struct MemoryFile {
+struct MemoryEntry {
     ino: INodeNo,
+    parent: INodeNo,
     name: String,
+    is_dir: bool,
     data: Vec<u8>,
     perm: u16,
 }
 
 struct State {
-    files: BTreeMap<String, MemoryFile>,
+    entries: BTreeMap<u64, MemoryEntry>,
     next_ino: u64,
 }
 
@@ -32,13 +34,16 @@ struct Ccfs {
 
 impl Ccfs {
     fn new() -> Self {
-        let mut files = BTreeMap::new();
+        let mut entries = BTreeMap::new();
 
-        files.insert(
-            "hello.txt".to_string(),
-            MemoryFile {
+        // Built-in demo file.
+        entries.insert(
+            2,
+            MemoryEntry {
                 ino: INodeNo(2),
+                parent: INodeNo::ROOT,
                 name: "hello.txt".to_string(),
+                is_dir: false,
                 data: b"Hello from CCFS!\n".to_vec(),
                 perm: 0o644,
             },
@@ -46,25 +51,29 @@ impl Ccfs {
 
         let mut next_ino = 3;
 
-        match db::load_file_metadata() {
-            Ok(metadata_files) => {
-                for meta in metadata_files {
-                    if meta.ino == 2 || meta.name == "hello.txt" {
+        match db::load_entries() {
+            Ok(metadata_entries) => {
+                for meta in metadata_entries {
+                    if meta.ino == 2 {
                         continue;
                     }
 
                     next_ino = next_ino.max(meta.ino + 1);
 
-                    let data = storage::load_file_data(meta.ino)
-                        .unwrap_or_else(|_| vec![0; meta.size as usize]);
+                    let data = if meta.is_dir {
+                        Vec::new()
+                    } else {
+                        storage::load_file_data(meta.ino)
+                            .unwrap_or_else(|_| vec![0; meta.size as usize])
+                    };
 
-                    let name = meta.name.clone();
-
-                    files.insert(
-                        name.clone(),
-                        MemoryFile {
+                    entries.insert(
+                        meta.ino,
+                        MemoryEntry {
                             ino: INodeNo(meta.ino),
-                            name,
+                            parent: INodeNo(meta.parent),
+                            name: meta.name,
+                            is_dir: meta.is_dir,
                             data,
                             perm: meta.perm,
                         },
@@ -73,12 +82,12 @@ impl Ccfs {
             }
 
             Err(err) => {
-                eprintln!("Failed to load file metadata: {}", err);
+                eprintln!("Failed to load filesystem metadata: {}", err);
             }
         }
 
         Self {
-            state: Mutex::new(State { files, next_ino }),
+            state: Mutex::new(State { entries, next_ino }),
         }
     }
 }
@@ -103,18 +112,32 @@ fn root_attr() -> FileAttr {
     }
 }
 
-fn file_attr(file: &MemoryFile) -> FileAttr {
+fn entry_kind(entry: &MemoryEntry) -> FileType {
+    if entry.is_dir {
+        FileType::Directory
+    } else {
+        FileType::RegularFile
+    }
+}
+
+fn entry_attr(entry: &MemoryEntry) -> FileAttr {
+    let size = if entry.is_dir {
+        0
+    } else {
+        entry.data.len() as u64
+    };
+
     FileAttr {
-        ino: file.ino,
-        size: file.data.len() as u64,
-        blocks: ((file.data.len() as u64) + 511) / 512,
+        ino: entry.ino,
+        size,
+        blocks: (size + 511) / 512,
         atime: UNIX_EPOCH,
         mtime: UNIX_EPOCH,
         ctime: UNIX_EPOCH,
         crtime: UNIX_EPOCH,
-        kind: FileType::RegularFile,
-        perm: file.perm,
-        nlink: 1,
+        kind: entry_kind(entry),
+        perm: entry.perm,
+        nlink: if entry.is_dir { 2 } else { 1 },
         uid: 1000,
         gid: 1000,
         rdev: 0,
@@ -123,21 +146,75 @@ fn file_attr(file: &MemoryFile) -> FileAttr {
     }
 }
 
+fn check_directory(state: &State, ino: INodeNo) -> Result<(), Errno> {
+    if ino == INodeNo::ROOT {
+        return Ok(());
+    }
+
+    match state.entries.get(&u64::from(ino)) {
+        Some(entry) if entry.is_dir => Ok(()),
+        Some(_) => Err(Errno::ENOTDIR),
+        None => Err(Errno::ENOENT),
+    }
+}
+
+fn find_child(state: &State, parent: INodeNo, name: &str) -> Option<u64> {
+    state
+        .entries
+        .iter()
+        .find(|(_, entry)| entry.parent == parent && entry.name == name)
+        .map(|(ino, _)| *ino)
+}
+
+fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INodeNo) -> bool {
+    let mut current = new_parent;
+    let mut steps = 0usize;
+
+    while current != INodeNo::ROOT {
+        let current_ino = u64::from(current);
+
+        if current_ino == moving_ino {
+            return true;
+        }
+
+        let Some(entry) = state.entries.get(&current_ino) else {
+            return false;
+        };
+
+        current = entry.parent;
+
+        steps += 1;
+
+        if steps > state.entries.len() {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl Filesystem for Ccfs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if parent != INodeNo::ROOT {
-            reply.error(Errno::ENOENT);
+        let state = self.state.lock().unwrap();
+
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
             return;
         }
 
-        let state = self.state.lock().unwrap();
         let name = name.to_string_lossy();
 
-        if let Some(file) = state.files.get(name.as_ref()) {
-            reply.entry(&TTL, &file_attr(file), Generation(0));
-        } else {
+        let Some(ino) = find_child(&state, parent, name.as_ref()) else {
             reply.error(Errno::ENOENT);
-        }
+            return;
+        };
+
+        let Some(entry) = state.entries.get(&ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        reply.entry(&TTL, &entry_attr(entry), Generation(0));
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -148,11 +225,12 @@ impl Filesystem for Ccfs {
 
         let state = self.state.lock().unwrap();
 
-        if let Some(file) = state.files.values().find(|file| file.ino == ino) {
-            reply.attr(&TTL, &file_attr(file));
-        } else {
+        let Some(entry) = state.entries.get(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
-        }
+            return;
+        };
+
+        reply.attr(&TTL, &entry_attr(entry));
     }
 
     fn setattr(
@@ -180,37 +258,50 @@ impl Filesystem for Ccfs {
 
         let mut state = self.state.lock().unwrap();
 
-        let Some(file) = state.files.values_mut().find(|file| file.ino == ino) else {
+        let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
         if let Some(mode) = mode {
-            file.perm = (mode & 0o777) as u16;
+            entry.perm = (mode & 0o777) as u16;
         }
 
         if let Some(size) = size {
-            file.data.resize(size as usize, 0);
+            if entry.is_dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
 
-            if let Err(err) = storage::save_file_data(u64::from(file.ino), &file.data) {
-                eprintln!("Failed to persist resized file data: {}", err);
+            entry.data.resize(size as usize, 0);
+
+            if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
+                eprintln!("Failed to persist resized file: {}", err);
                 reply.error(Errno::EIO);
                 return;
             }
         }
 
-        if let Err(err) = db::save_file_metadata(
-            u64::from(file.ino),
-            &file.name,
-            file.perm,
-            file.data.len() as u64,
+        let metadata_size = if entry.is_dir {
+            0
+        } else {
+            entry.data.len() as u64
+        };
+
+        if let Err(err) = db::save_entry_metadata(
+            u64::from(entry.ino),
+            u64::from(entry.parent),
+            &entry.name,
+            entry.is_dir,
+            entry.perm,
+            metadata_size,
         ) {
-            eprintln!("Failed to update file metadata: {}", err);
+            eprintln!("Failed to update metadata: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        reply.attr(&TTL, &file_attr(file));
+        reply.attr(&TTL, &entry_attr(entry));
     }
 
     fn readdir(
@@ -221,29 +312,97 @@ impl Filesystem for Ccfs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if ino != INodeNo::ROOT {
-            reply.error(Errno::ENOTDIR);
+        let state = self.state.lock().unwrap();
+
+        if let Err(err) = check_directory(&state, ino) {
+            reply.error(err);
             return;
         }
 
-        let state = self.state.lock().unwrap();
+        let parent_ino = if ino == INodeNo::ROOT {
+            INodeNo::ROOT
+        } else {
+            state
+                .entries
+                .get(&u64::from(ino))
+                .map(|entry| entry.parent)
+                .unwrap_or(INodeNo::ROOT)
+        };
 
         let mut entries: Vec<(INodeNo, FileType, String)> = vec![
-            (INodeNo::ROOT, FileType::Directory, ".".to_string()),
-            (INodeNo::ROOT, FileType::Directory, "..".to_string()),
+            (ino, FileType::Directory, ".".to_string()),
+            (parent_ino, FileType::Directory, "..".to_string()),
         ];
 
-        for file in state.files.values() {
-            entries.push((file.ino, FileType::RegularFile, file.name.clone()));
+        let mut children: Vec<&MemoryEntry> = state
+            .entries
+            .values()
+            .filter(|entry| entry.parent == ino)
+            .collect();
+
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for child in children {
+            entries.push((child.ino, entry_kind(child), child.name.clone()));
         }
 
-        for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(entry.0, (i + 1) as u64, entry.1, &entry.2) {
+        for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
+            if reply.add(entry.0, (index + 1) as u64, entry.1, &entry.2) {
                 break;
             }
         }
 
         reply.ok();
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_string_lossy().into_owned();
+
+        let mut state = self.state.lock().unwrap();
+
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
+            return;
+        }
+
+        if find_child(&state, parent, &name).is_some() {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
+        let ino_value = state.next_ino;
+        state.next_ino += 1;
+
+        let entry = MemoryEntry {
+            ino: INodeNo(ino_value),
+            parent,
+            name: name.clone(),
+            is_dir: true,
+            data: Vec::new(),
+            perm: (mode & !umask & 0o777) as u16,
+        };
+
+        let attr = entry_attr(&entry);
+
+        if let Err(err) =
+            db::save_entry_metadata(ino_value, u64::from(parent), &name, true, entry.perm, 0)
+        {
+            eprintln!("Failed to persist directory metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        state.entries.insert(ino_value, entry);
+
+        reply.entry(&TTL, &attr, Generation(0));
     }
 
     fn create(
@@ -256,41 +415,43 @@ impl Filesystem for Ccfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        if parent != INodeNo::ROOT {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
         let name = name.to_string_lossy().into_owned();
 
         let mut state = self.state.lock().unwrap();
 
-        if state.files.contains_key(&name) {
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
+            return;
+        }
+
+        if find_child(&state, parent, &name).is_some() {
             reply.error(Errno::EEXIST);
             return;
         }
 
-        let ino = INodeNo(state.next_ino);
+        let ino_value = state.next_ino;
         state.next_ino += 1;
 
-        let file = MemoryFile {
-            ino,
+        let entry = MemoryEntry {
+            ino: INodeNo(ino_value),
+            parent,
             name: name.clone(),
+            is_dir: false,
             data: Vec::new(),
             perm: (mode & !umask & 0o777) as u16,
         };
 
-        let attr = file_attr(&file);
+        let attr = entry_attr(&entry);
 
         if let Err(err) =
-            db::save_file_metadata(u64::from(ino), &name, file.perm, file.data.len() as u64)
+            db::save_entry_metadata(ino_value, u64::from(parent), &name, false, entry.perm, 0)
         {
-            eprintln!("Failed to save file metadata: {}", err);
+            eprintln!("Failed to persist file metadata: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        state.files.insert(name, file);
+        state.entries.insert(ino_value, entry);
 
         reply.created(
             &TTL,
@@ -302,38 +463,95 @@ impl Filesystem for Ccfs {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if parent != INodeNo::ROOT {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
         let name = name.to_string_lossy().into_owned();
-
-        if name == "hello.txt" {
-            reply.error(Errno::EPERM);
-            return;
-        }
 
         let mut state = self.state.lock().unwrap();
 
-        let Some(ino) = state.files.get(&name).map(|file| file.ino) else {
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
+            return;
+        }
+
+        let Some(ino_value) = find_child(&state, parent, &name) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
-        if let Err(err) = storage::delete_file_data(u64::from(ino)) {
-            eprintln!("Failed to delete file data: {}", err);
+        if ino_value == 2 {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
+        let Some(entry) = state.entries.get(&ino_value) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if entry.is_dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
+        if let Err(err) = storage::delete_file_data(ino_value) {
+            eprintln!("Failed to delete file contents: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        if let Err(err) = db::delete_file_metadata(u64::from(ino)) {
+        if let Err(err) = db::delete_entry_metadata(ino_value) {
             eprintln!("Failed to delete file metadata: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        state.files.remove(&name);
+        state.entries.remove(&ino_value);
+
+        reply.ok();
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let name = name.to_string_lossy().into_owned();
+
+        let mut state = self.state.lock().unwrap();
+
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
+            return;
+        }
+
+        let Some(ino_value) = find_child(&state, parent, &name) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        let Some(entry) = state.entries.get(&ino_value) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if !entry.is_dir {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+
+        let directory_ino = entry.ino;
+
+        if state
+            .entries
+            .values()
+            .any(|child| child.parent == directory_ino)
+        {
+            reply.error(Errno::ENOTEMPTY);
+            return;
+        }
+
+        if let Err(err) = db::delete_entry_metadata(ino_value) {
+            eprintln!("Failed to delete directory metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        state.entries.remove(&ino_value);
 
         reply.ok();
     }
@@ -348,12 +566,6 @@ impl Filesystem for Ccfs {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if parent != INodeNo::ROOT || newparent != INodeNo::ROOT {
-            reply.error(Errno::ENOENT);
-            return;
-        }
-
-        // Current milestone supports normal rename only.
         if !flags.is_empty() {
             reply.error(Errno::EINVAL);
             return;
@@ -362,48 +574,62 @@ impl Filesystem for Ccfs {
         let old_name = name.to_string_lossy().into_owned();
         let new_name = newname.to_string_lossy().into_owned();
 
-        if old_name == "hello.txt" {
-            reply.error(Errno::EPERM);
-            return;
-        }
-
-        if old_name == new_name {
-            reply.ok();
-            return;
-        }
-
         let mut state = self.state.lock().unwrap();
 
-        if !state.files.contains_key(&old_name) {
-            reply.error(Errno::ENOENT);
+        if let Err(err) = check_directory(&state, parent) {
+            reply.error(err);
             return;
         }
 
-        // For now we do not overwrite an existing destination file.
-        if state.files.contains_key(&new_name) {
-            reply.error(Errno::EEXIST);
+        if let Err(err) = check_directory(&state, newparent) {
+            reply.error(err);
             return;
         }
 
-        let Some(mut file) = state.files.remove(&old_name) else {
+        let Some(ino_value) = find_child(&state, parent, &old_name) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
-        let ino = file.ino;
+        if ino_value == 2 {
+            reply.error(Errno::EPERM);
+            return;
+        }
 
-        if let Err(err) = db::rename_file_metadata(u64::from(ino), &new_name) {
-            eprintln!("Failed to rename file metadata: {}", err);
+        if parent == newparent && old_name == new_name {
+            reply.ok();
+            return;
+        }
 
-            // Roll back the in-memory removal.
-            state.files.insert(old_name, file);
+        if find_child(&state, newparent, &new_name).is_some() {
+            reply.error(Errno::EEXIST);
+            return;
+        }
 
+        let is_dir = state
+            .entries
+            .get(&ino_value)
+            .map(|entry| entry.is_dir)
+            .unwrap_or(false);
+
+        if is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+
+        if let Err(err) = db::rename_entry_metadata(ino_value, u64::from(newparent), &new_name) {
+            eprintln!("Failed to persist rename: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        file.name = new_name.clone();
-        state.files.insert(new_name, file);
+        let Some(entry) = state.entries.get_mut(&ino_value) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        entry.parent = newparent;
+        entry.name = new_name;
 
         reply.ok();
     }
@@ -421,21 +647,26 @@ impl Filesystem for Ccfs {
     ) {
         let state = self.state.lock().unwrap();
 
-        let Some(file) = state.files.values().find(|file| file.ino == ino) else {
+        let Some(entry) = state.entries.get(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
+        if entry.is_dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
         let start = offset as usize;
 
-        if start >= file.data.len() {
+        if start >= entry.data.len() {
             reply.data(&[]);
             return;
         }
 
-        let end = (start + size as usize).min(file.data.len());
+        let end = (start + size as usize).min(entry.data.len());
 
-        reply.data(&file.data[start..end]);
+        reply.data(&entry.data[start..end]);
     }
 
     fn write(
@@ -452,35 +683,42 @@ impl Filesystem for Ccfs {
     ) {
         let mut state = self.state.lock().unwrap();
 
-        let Some(file) = state.files.values_mut().find(|file| file.ino == ino) else {
+        let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
+        if entry.is_dir {
+            reply.error(Errno::EISDIR);
+            return;
+        }
+
         let start = offset as usize;
         let end = start + data.len();
 
-        if file.data.len() < start {
-            file.data.resize(start, 0);
+        if entry.data.len() < start {
+            entry.data.resize(start, 0);
         }
 
-        if file.data.len() < end {
-            file.data.resize(end, 0);
+        if entry.data.len() < end {
+            entry.data.resize(end, 0);
         }
 
-        file.data[start..end].copy_from_slice(data);
+        entry.data[start..end].copy_from_slice(data);
 
-        if let Err(err) = storage::save_file_data(u64::from(file.ino), &file.data) {
-            eprintln!("Failed to persist file data: {}", err);
+        if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
+            eprintln!("Failed to persist file contents: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        if let Err(err) = db::save_file_metadata(
-            u64::from(file.ino),
-            &file.name,
-            file.perm,
-            file.data.len() as u64,
+        if let Err(err) = db::save_entry_metadata(
+            u64::from(entry.ino),
+            u64::from(entry.parent),
+            &entry.name,
+            false,
+            entry.perm,
+            entry.data.len() as u64,
         ) {
             eprintln!("Failed to update file metadata: {}", err);
             reply.error(Errno::EIO);
@@ -526,7 +764,11 @@ fn main() {
         .mount_options
         .push(MountOption::FSName("ccfs".to_string()));
 
-    println!("CCFS writable filesystem mounting at: {}", mountpoint);
+    println!(
+        "CCFS directory-aware filesystem mounting at: {}",
+        mountpoint
+    );
+
     println!("Press Ctrl+C to stop the filesystem.");
 
     fuser::mount(Ccfs::new(), mountpoint, &config).expect("Failed to mount CCFS");
