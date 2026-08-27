@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 fuser = "0.18.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -1,1 +1,8 @@
 /target
+
+# CCFS runtime data
+volume/*.db
+volume/*.db-wal
+volume/*.db-shm
+volume/blocks/*
+!volume/blocks/.gitkeep

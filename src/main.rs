@@ -1,15 +1,14 @@
+mod db;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::sync::Mutex;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
-    Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyWrite, Request, WriteFlags,
+    BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
+    Generation, INodeNo, LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-
 const TTL: Duration = Duration::from_secs(1);
 
 struct MemoryFile {
@@ -42,11 +41,36 @@ impl Ccfs {
             },
         );
 
+        let mut next_ino = 3;
+
+        match db::load_file_metadata() {
+            Ok(metadata_files) => {
+                for meta in metadata_files {
+                    if meta.ino == 2 || meta.name == "hello.txt" {
+                        continue;
+                    }
+
+                    next_ino = next_ino.max(meta.ino + 1);
+
+                    files.insert(
+                        meta.name.clone(),
+                        MemoryFile {
+                            ino: INodeNo(meta.ino),
+                            name: meta.name,
+                            data: vec![0; meta.size as usize],
+                            perm: meta.perm,
+                        },
+                    );
+                }
+            }
+
+            Err(err) => {
+                eprintln!("Failed to load file metadata: {}", err);
+            }
+        }
+
         Self {
-            state: Mutex::new(State {
-                files,
-                next_ino: 3,
-            }),
+            state: Mutex::new(State { files, next_ino }),
         }
     }
 }
@@ -92,13 +116,7 @@ fn file_attr(file: &MemoryFile) -> FileAttr {
 }
 
 impl Filesystem for Ccfs {
-    fn lookup(
-        &self,
-        _req: &Request,
-        parent: INodeNo,
-        name: &OsStr,
-        reply: ReplyEntry,
-    ) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         if parent != INodeNo::ROOT {
             reply.error(Errno::ENOENT);
             return;
@@ -114,13 +132,7 @@ impl Filesystem for Ccfs {
         }
     }
 
-    fn getattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: Option<FileHandle>,
-        reply: ReplyAttr,
-    ) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == INodeNo::ROOT {
             reply.attr(&TTL, &root_attr());
             return;
@@ -134,7 +146,57 @@ impl Filesystem for Ccfs {
             reply.error(Errno::ENOENT);
         }
     }
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        if ino == INodeNo::ROOT {
+            reply.attr(&TTL, &root_attr());
+            return;
+        }
 
+        let mut state = self.state.lock().unwrap();
+
+        let Some(file) = state.files.values_mut().find(|file| file.ino == ino) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+
+        if let Some(mode) = mode {
+            file.perm = (mode & 0o777) as u16;
+        }
+
+        if let Some(size) = size {
+            file.data.resize(size as usize, 0);
+        }
+
+        if let Err(err) = db::save_file_metadata(
+            u64::from(file.ino),
+            &file.name,
+            file.perm,
+            file.data.len() as u64,
+        ) {
+            eprintln!("Failed to update file metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        reply.attr(&TTL, &file_attr(file));
+    }
     fn readdir(
         &self,
         _req: &Request,
@@ -156,20 +218,11 @@ impl Filesystem for Ccfs {
         ];
 
         for file in state.files.values() {
-            entries.push((
-                file.ino,
-                FileType::RegularFile,
-                file.name.clone(),
-            ));
+            entries.push((file.ino, FileType::RegularFile, file.name.clone()));
         }
 
         for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
-            if reply.add(
-                entry.0,
-                (i + 1) as u64,
-                entry.1,
-                &entry.2,
-            ) {
+            if reply.add(entry.0, (i + 1) as u64, entry.1, &entry.2) {
                 break;
             }
         }
@@ -212,6 +265,14 @@ impl Filesystem for Ccfs {
         };
 
         let attr = file_attr(&file);
+
+        if let Err(err) =
+            db::save_file_metadata(u64::from(ino), &name, file.perm, file.data.len() as u64)
+        {
+            eprintln!("Failed to save file metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
 
         state.files.insert(name, file);
 
@@ -268,11 +329,7 @@ impl Filesystem for Ccfs {
     ) {
         let mut state = self.state.lock().unwrap();
 
-        let Some(file) = state
-            .files
-            .values_mut()
-            .find(|file| file.ino == ino)
-        else {
+        let Some(file) = state.files.values_mut().find(|file| file.ino == ino) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -317,6 +374,9 @@ impl Filesystem for Ccfs {
 }
 
 fn main() {
+    let _db = db::init_database().expect("Failed to initialize SQLite database");
+
+    println!("SQLite metadata database ready.");
     let mountpoint = "mount";
 
     let mut config = Config::default();
@@ -328,6 +388,5 @@ fn main() {
     println!("CCFS writable filesystem mounting at: {}", mountpoint);
     println!("Press Ctrl+C to stop the filesystem.");
 
-    fuser::mount(Ccfs::new(), mountpoint, &config)
-        .expect("Failed to mount CCFS");
+    fuser::mount(Ccfs::new(), mountpoint, &config).expect("Failed to mount CCFS");
 }
