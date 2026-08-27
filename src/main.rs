@@ -30,6 +30,7 @@ const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
 const DELETE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSDEL1";
 const RMDIR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSRMD1";
 const TRUNCATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSTRN1";
+const SETATTR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSATR1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -90,6 +91,31 @@ struct WriteJournalPayload {
 }
 
 #[derive(Debug)]
+struct TruncateJournalPayload {
+    ino: u64,
+    parent: u64,
+    name: String,
+    perm: u16,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct SetattrJournalPayload {
+    ino: u64,
+    parent: u64,
+    name: String,
+    is_dir: bool,
+    perm: u16,
+    size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+}
+
+#[derive(Debug)]
 struct RenameJournalPayload {
     ino: u64,
     new_parent: u64,
@@ -110,18 +136,6 @@ struct DeleteJournalPayload {
 #[derive(Debug)]
 struct RmdirJournalPayload {
     ino: u64,
-}
-
-#[derive(Debug)]
-struct TruncateJournalPayload {
-    ino: u64,
-    parent: u64,
-    name: String,
-    perm: u16,
-    atime: i64,
-    mtime: i64,
-    ctime: i64,
-    data: Vec<u8>,
 }
 
 fn database_io_error(error: rusqlite::Error) -> io::Error {
@@ -204,7 +218,9 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
     }
 
     let mut output = [0u8; N];
+
     output.copy_from_slice(&payload[*cursor..*cursor + N]);
+
     *cursor += N;
 
     Ok(output)
@@ -352,10 +368,15 @@ fn decode_write_payload(payload: &[u8]) -> io::Result<WriteJournalPayload> {
     let mut cursor = WRITE_PAYLOAD_MAGIC.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -432,15 +453,25 @@ fn encode_truncate_payload(payload: &TruncateJournalPayload) -> io::Result<Vec<u
     let mut output = Vec::new();
 
     output.extend_from_slice(TRUNCATE_PAYLOAD_MAGIC);
+
     output.extend_from_slice(&payload.ino.to_le_bytes());
+
     output.extend_from_slice(&payload.parent.to_le_bytes());
+
     output.extend_from_slice(&payload.perm.to_le_bytes());
+
     output.extend_from_slice(&payload.atime.to_le_bytes());
+
     output.extend_from_slice(&payload.mtime.to_le_bytes());
+
     output.extend_from_slice(&payload.ctime.to_le_bytes());
+
     output.extend_from_slice(&name_length.to_le_bytes());
+
     output.extend_from_slice(&data_length.to_le_bytes());
+
     output.extend_from_slice(name_bytes);
+
     output.extend_from_slice(&payload.data);
 
     Ok(output)
@@ -521,12 +552,6 @@ fn decode_truncate_payload(payload: &[u8]) -> io::Result<TruncateJournalPayload>
 }
 
 fn apply_truncate_payload(txid: u64, payload: &TruncateJournalPayload) -> io::Result<()> {
-    /*
-     * Persist the final complete post-truncate block first.
-     *
-     * If CCFS crashes before SQLite commit, startup recovery
-     * replays this same committed transaction.
-     */
     storage::save_file_data(payload.ino, &payload.data)?;
 
     db::save_entry_metadata_with_times_and_mark_tx(
@@ -537,6 +562,131 @@ fn apply_truncate_payload(txid: u64, payload: &TruncateJournalPayload) -> io::Re
         false,
         payload.perm,
         payload.data.len() as u64,
+        payload.atime,
+        payload.mtime,
+        payload.ctime,
+    )
+    .map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
+ * SETATTR
+ * ============================================================
+ */
+
+fn encode_setattr_payload(payload: &SetattrJournalPayload) -> io::Result<Vec<u8>> {
+    let name_bytes = payload.name.as_bytes();
+
+    let name_length = u32::try_from(name_bytes.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SETATTR filename too large"))?;
+
+    let mut output = Vec::new();
+
+    output.extend_from_slice(SETATTR_PAYLOAD_MAGIC);
+
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+
+    output.extend_from_slice(&payload.parent.to_le_bytes());
+
+    output.push(if payload.is_dir { 1 } else { 0 });
+
+    output.extend_from_slice(&payload.perm.to_le_bytes());
+
+    output.extend_from_slice(&payload.size.to_le_bytes());
+
+    output.extend_from_slice(&payload.atime.to_le_bytes());
+
+    output.extend_from_slice(&payload.mtime.to_le_bytes());
+
+    output.extend_from_slice(&payload.ctime.to_le_bytes());
+
+    output.extend_from_slice(&name_length.to_le_bytes());
+
+    output.extend_from_slice(name_bytes);
+
+    Ok(output)
+}
+
+fn decode_setattr_payload(payload: &[u8]) -> io::Result<SetattrJournalPayload> {
+    if payload.len() < SETATTR_PAYLOAD_MAGIC.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SETATTR payload is too short",
+        ));
+    }
+
+    if &payload[..SETATTR_PAYLOAD_MAGIC.len()] != SETATTR_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SETATTR payload magic",
+        ));
+    }
+
+    let mut cursor = SETATTR_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let is_dir = match read_array::<1>(payload, &mut cursor)?[0] {
+        0 => false,
+        1 => true,
+
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid SETATTR directory flag",
+            ));
+        }
+    };
+
+    let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
+    let size = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
+
+    if payload.len().saturating_sub(cursor) != name_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SETATTR filename length",
+        ));
+    }
+
+    let name = String::from_utf8(payload[cursor..].to_vec()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "SETATTR filename invalid UTF-8")
+    })?;
+
+    Ok(SetattrJournalPayload {
+        ino,
+        parent,
+        name,
+        is_dir,
+        perm,
+        size,
+        atime,
+        mtime,
+        ctime,
+    })
+}
+
+fn apply_setattr_payload(txid: u64, payload: &SetattrJournalPayload) -> io::Result<()> {
+    db::save_entry_metadata_with_times_and_mark_tx(
+        txid,
+        payload.ino,
+        payload.parent,
+        &payload.name,
+        payload.is_dir,
+        payload.perm,
+        payload.size,
         payload.atime,
         payload.mtime,
         payload.ctime,
@@ -560,17 +710,25 @@ fn encode_rename_payload(payload: &RenameJournalPayload) -> io::Result<Vec<u8>> 
     let mut output = Vec::new();
 
     output.extend_from_slice(RENAME_PAYLOAD_MAGIC);
+
     output.extend_from_slice(&payload.ino.to_le_bytes());
+
     output.extend_from_slice(&payload.new_parent.to_le_bytes());
 
     output.push(if payload.is_dir { 1 } else { 0 });
 
     output.extend_from_slice(&payload.perm.to_le_bytes());
+
     output.extend_from_slice(&payload.size.to_le_bytes());
+
     output.extend_from_slice(&payload.atime.to_le_bytes());
+
     output.extend_from_slice(&payload.mtime.to_le_bytes());
+
     output.extend_from_slice(&payload.ctime.to_le_bytes());
+
     output.extend_from_slice(&name_length.to_le_bytes());
+
     output.extend_from_slice(name_bytes);
 
     Ok(output)
@@ -778,7 +936,7 @@ fn apply_rmdir_payload(txid: u64, payload: &RmdirJournalPayload) -> io::Result<(
 }
 
 /* ============================================================
- * RECOVERY
+ * STARTUP RECOVERY
  * ============================================================
  */
 
@@ -800,6 +958,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             let payload = decode_truncate_payload(&transaction.payload)?;
 
             apply_truncate_payload(transaction.txid, &payload)
+        }
+
+        "SETATTR" => {
+            let payload = decode_setattr_payload(&transaction.payload)?;
+
+            apply_setattr_payload(transaction.txid, &payload)
         }
 
         "RENAME" => {
@@ -842,13 +1006,21 @@ impl Ccfs {
             2,
             MemoryEntry {
                 ino: INodeNo(2),
+
                 parent: INodeNo::ROOT,
+
                 name: "hello.txt".to_string(),
+
                 is_dir: false,
+
                 data: b"Hello from CCFS!\n".to_vec(),
+
                 perm: 0o644,
+
                 atime: now,
+
                 mtime: now,
+
                 ctime: now,
             },
         );
@@ -940,19 +1112,33 @@ impl Ccfs {
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: INodeNo::ROOT,
+
         size: 0,
+
         blocks: 0,
+
         atime: UNIX_EPOCH,
+
         mtime: UNIX_EPOCH,
+
         ctime: UNIX_EPOCH,
+
         crtime: UNIX_EPOCH,
+
         kind: FileType::Directory,
+
         perm: 0o755,
+
         nlink: 2,
+
         uid: 1000,
+
         gid: 1000,
+
         rdev: 0,
+
         blksize: 4096,
+
         flags: 0,
     }
 }
@@ -974,19 +1160,33 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
 
     FileAttr {
         ino: entry.ino,
+
         size,
+
         blocks: (size + 511) / 512,
+
         atime: entry.atime,
+
         mtime: entry.mtime,
+
         ctime: entry.ctime,
+
         crtime: entry.ctime,
+
         kind: entry_kind(entry),
+
         perm: entry.perm,
+
         nlink: if entry.is_dir { 2 } else { 1 },
+
         uid: 1000,
+
         gid: 1000,
+
         rdev: 0,
+
         blksize: 4096,
+
         flags: 0,
     }
 }
@@ -1058,6 +1258,7 @@ fn migrate_checksums() {
     };
 
     println!("CCFS checksum migration");
+
     println!("-----------------------");
 
     let entries = match db::load_entries() {
@@ -1159,6 +1360,7 @@ fn check_integrity() {
     };
 
     println!("CCFS integrity check");
+
     println!("--------------------");
 
     let entries = match db::load_entries() {
@@ -1425,9 +1627,7 @@ impl Filesystem for Ccfs {
 
             final_data.resize(new_size_usize, 0);
 
-            let now = SystemTime::now();
-
-            new_mtime = now;
+            new_mtime = SystemTime::now();
 
             changed = true;
 
@@ -1461,8 +1661,7 @@ impl Filesystem for Ccfs {
         }
 
         /*
-         * Any setattr request containing a size mutation becomes
-         * a crash-recoverable TRUNCATE transaction.
+         * A request containing size is a TRUNCATE transaction.
          */
         if size_requested {
             let payload = TruncateJournalPayload {
@@ -1542,7 +1741,78 @@ impl Filesystem for Ccfs {
             return;
         }
 
+        /*
+         * chmod / atime / mtime / ctime changes use SETATTR.
+         */
         if changed {
+            let payload = SetattrJournalPayload {
+                ino: u64::from(entry.ino),
+
+                parent: u64::from(entry.parent),
+
+                name: entry.name.clone(),
+
+                is_dir: entry.is_dir,
+
+                perm: new_perm,
+
+                size: if entry.is_dir {
+                    0
+                } else {
+                    entry.data.len() as u64
+                },
+
+                atime: system_time_to_timestamp(new_atime),
+
+                mtime: system_time_to_timestamp(new_mtime),
+
+                ctime: system_time_to_timestamp(new_ctime),
+            };
+
+            let encoded_payload = match encode_setattr_payload(&payload) {
+                Ok(encoded) => encoded,
+
+                Err(err) => {
+                    eprintln!("Failed SETATTR payload encode: {}", err);
+
+                    reply.error(Errno::EIO);
+
+                    return;
+                }
+            };
+
+            let txid = match journal::begin_transaction("SETATTR", &encoded_payload) {
+                Ok(txid) => txid,
+
+                Err(err) => {
+                    eprintln!("Failed SETATTR BEGIN: {}", err);
+
+                    reply.error(Errno::EIO);
+
+                    return;
+                }
+            };
+
+            maybe_kill9("SETATTR", "after_begin");
+
+            if let Err(err) = journal::commit_transaction(txid) {
+                eprintln!("Failed SETATTR COMMIT: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+
+            maybe_kill9("SETATTR", "after_commit");
+
+            if let Err(err) = apply_setattr_payload(txid, &payload) {
+                eprintln!("Committed SETATTR {} apply failed: {}", txid, err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+
             entry.perm = new_perm;
 
             entry.atime = new_atime;
@@ -1550,14 +1820,6 @@ impl Filesystem for Ccfs {
             entry.mtime = new_mtime;
 
             entry.ctime = new_ctime;
-
-            if let Err(err) = persist_entry(entry) {
-                eprintln!("Failed to update metadata: {}", err);
-
-                reply.error(Errno::EIO);
-
-                return;
-            }
         }
 
         reply.attr(&TTL, &entry_attr(entry));
@@ -2170,6 +2432,7 @@ impl Filesystem for Ccfs {
 
         if start >= entry.data.len() {
             reply.data(&[]);
+
             return;
         }
 
