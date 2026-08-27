@@ -1,10 +1,12 @@
 mod db;
+mod journal;
+mod recovery;
 mod storage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
 use std::process;
 use std::sync::Mutex;
@@ -20,6 +22,7 @@ use storage::IntegrityStatus;
 
 const TTL: Duration = Duration::from_secs(1);
 const NAME_MAX: usize = 255;
+const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -54,6 +57,24 @@ struct State {
 
 struct Ccfs {
     state: Mutex<State>,
+}
+
+#[derive(Debug)]
+struct CreateJournalPayload {
+    ino: u64,
+    parent: u64,
+    name: String,
+    perm: u16,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
+}
+
+fn database_io_error(error: rusqlite::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Other,
+        format!("metadata database error: {error}"),
+    )
 }
 
 fn timestamp_to_system_time(timestamp: i64) -> SystemTime {
@@ -97,6 +118,145 @@ fn persist_entry(entry: &MemoryEntry) -> rusqlite::Result<()> {
     )
 }
 
+fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
+    let name_bytes = entry.name.as_bytes();
+
+    let mut payload = Vec::with_capacity(
+        CREATE_PAYLOAD_MAGIC.len() + 8 + 8 + 2 + 8 + 8 + 8 + 4 + name_bytes.len(),
+    );
+
+    payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
+    payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
+    payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
+    payload.extend_from_slice(&entry.perm.to_le_bytes());
+
+    payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
+
+    payload.extend_from_slice(&system_time_to_timestamp(entry.mtime).to_le_bytes());
+
+    payload.extend_from_slice(&system_time_to_timestamp(entry.ctime).to_le_bytes());
+
+    payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+
+    payload.extend_from_slice(name_bytes);
+
+    payload
+}
+
+fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<[u8; N]> {
+    if payload.len().saturating_sub(*cursor) < N {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal CREATE payload is truncated",
+        ));
+    }
+
+    let mut output = [0u8; N];
+
+    output.copy_from_slice(&payload[*cursor..*cursor + N]);
+
+    *cursor += N;
+
+    Ok(output)
+}
+
+fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
+    if payload.len() < CREATE_PAYLOAD_MAGIC.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CREATE journal payload is too short",
+        ));
+    }
+
+    if &payload[..CREATE_PAYLOAD_MAGIC.len()] != CREATE_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CREATE journal payload has invalid format",
+        ));
+    }
+
+    let mut cursor = CREATE_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
+    let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
+
+    if payload.len().saturating_sub(cursor) != name_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CREATE journal filename length is invalid",
+        ));
+    }
+
+    let name = String::from_utf8(payload[cursor..].to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CREATE journal filename is not valid UTF-8",
+        )
+    })?;
+
+    Ok(CreateJournalPayload {
+        ino,
+        parent,
+        name,
+        perm,
+        atime,
+        mtime,
+        ctime,
+    })
+}
+
+fn apply_create_payload(payload: &CreateJournalPayload) -> io::Result<()> {
+    /*
+     * CREATE replay is deliberately idempotent.
+     *
+     * Rewriting the same empty block produces the same state, and
+     * SQLite save_entry_metadata_with_times() upserts by inode.
+     */
+
+    storage::save_file_data(payload.ino, &[])?;
+
+    db::save_entry_metadata_with_times(
+        payload.ino,
+        payload.parent,
+        &payload.name,
+        false,
+        payload.perm,
+        0,
+        payload.atime,
+        payload.mtime,
+        payload.ctime,
+    )
+    .map_err(database_io_error)?;
+
+    Ok(())
+}
+
+fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
+    recovery::recover_with(|transaction| match transaction.operation.as_str() {
+        "CREATE" => {
+            let payload = decode_create_payload(&transaction.payload)?;
+
+            apply_create_payload(&payload)
+        }
+
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported committed journal operation: {other}"),
+        )),
+    })
+}
+
 impl Ccfs {
     fn new() -> Self {
         let mut entries = BTreeMap::new();
@@ -134,8 +294,6 @@ impl Ccfs {
                         match storage::load_file_data(meta.ino) {
                             Ok(data) => data,
 
-                            // Legacy zero-byte files created before block storage
-                            // initialization may have metadata but no .bin file.
                             Err(err) if err.kind() == ErrorKind::NotFound && meta.size == 0 => {
                                 match storage::save_file_data(meta.ino, &[]) {
                                     Ok(()) => {
@@ -298,8 +456,10 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
 fn migrate_checksums() {
     let _db = match db::init_database() {
         Ok(conn) => conn,
+
         Err(err) => {
             eprintln!("Failed to initialize metadata database: {}", err);
+
             process::exit(1);
         }
     };
@@ -309,8 +469,10 @@ fn migrate_checksums() {
 
     let entries = match db::load_entries() {
         Ok(entries) => entries,
+
         Err(err) => {
             eprintln!("Failed to load metadata: {}", err);
+
             process::exit(1);
         }
     };
@@ -364,6 +526,7 @@ fn migrate_checksums() {
 
     if unrecoverable_missing_blocks > 0 {
         eprintln!();
+
         eprintln!(
             "Migration stopped: {} non-empty file(s) are missing data blocks.",
             unrecoverable_missing_blocks
@@ -377,21 +540,26 @@ fn migrate_checksums() {
 
         Err(err) => {
             eprintln!("Checksum migration failed: {}", err);
+
             process::exit(1);
         }
     };
 
     println!();
     println!("Migration completed.");
+
     println!("Legacy empty blocks repaired: {}", repaired_empty_files);
+
     println!("Checksums created: {}", migrated_checksums);
 }
 
 fn check_integrity() {
     let _db = match db::init_database() {
         Ok(conn) => conn,
+
         Err(err) => {
             eprintln!("Failed to initialize metadata database: {}", err);
+
             process::exit(1);
         }
     };
@@ -404,6 +572,7 @@ fn check_integrity() {
 
         Err(err) => {
             eprintln!("Unable to read filesystem metadata: {}", err);
+
             process::exit(1);
         }
     };
@@ -478,6 +647,7 @@ fn check_integrity() {
 
         Err(err) => {
             failures += 1;
+
             println!("[FAIL] unable to enumerate block files: {}", err);
         }
     }
@@ -496,20 +666,55 @@ fn check_integrity() {
     }
 }
 
+fn show_recovery_status() {
+    let summary = match recovery::inspect_recovery_state() {
+        Ok(summary) => summary,
+
+        Err(err) => {
+            eprintln!("Unable to inspect recovery state: {}", err);
+
+            process::exit(1);
+        }
+    };
+
+    recovery::print_summary(&summary);
+
+    match recovery::applied_transaction_count() {
+        Ok(count) => {
+            println!("Applied transaction records: {}", count);
+        }
+
+        Err(err) => {
+            eprintln!("Unable to read applied transaction count: {}", err);
+
+            process::exit(1);
+        }
+    }
+}
+
 fn print_usage() {
     println!("CCFS");
     println!();
+
     println!("Usage:");
     println!("  ccfs");
     println!("  ccfs --migrate-checksums");
     println!("  ccfs --check-integrity");
+    println!("  ccfs --recovery-status");
     println!();
+
     println!("Commands:");
+
     println!("  --migrate-checksums");
     println!("      Repair legacy empty-file blocks and create missing checksums.");
     println!();
+
     println!("  --check-integrity");
     println!("      Compare SQLite metadata, data blocks and stored checksums.");
+    println!();
+
+    println!("  --recovery-status");
+    println!("      Show journal and applied transaction recovery state.");
 }
 
 impl Filesystem for Ccfs {
@@ -592,6 +797,7 @@ impl Filesystem for Ccfs {
 
         if let Some(mode) = mode {
             entry.perm = (mode & 0o777) as u16;
+
             changed = true;
             change_ctime = true;
         }
@@ -605,6 +811,7 @@ impl Filesystem for Ccfs {
             entry.data.resize(size as usize, 0);
 
             let now = SystemTime::now();
+
             entry.mtime = now;
 
             changed = true;
@@ -612,6 +819,7 @@ impl Filesystem for Ccfs {
 
             if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
                 eprintln!("Failed to persist resized file: {}", err);
+
                 reply.error(Errno::EIO);
                 return;
             }
@@ -619,11 +827,13 @@ impl Filesystem for Ccfs {
 
         if let Some(value) = atime {
             entry.atime = resolve_time(value);
+
             changed = true;
         }
 
         if let Some(value) = mtime {
             entry.mtime = resolve_time(value);
+
             changed = true;
             change_ctime = true;
         }
@@ -642,6 +852,7 @@ impl Filesystem for Ccfs {
         if changed {
             if let Err(err) = persist_entry(entry) {
                 eprintln!("Failed to update metadata: {}", err);
+
                 reply.error(Errno::EIO);
                 return;
             }
@@ -716,6 +927,7 @@ impl Filesystem for Ccfs {
         }
 
         let name = name.to_string_lossy().into_owned();
+
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -729,6 +941,7 @@ impl Filesystem for Ccfs {
         }
 
         let ino_value = state.next_ino;
+
         state.next_ino += 1;
 
         let now = SystemTime::now();
@@ -749,6 +962,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = persist_entry(&entry) {
             eprintln!("Failed to persist directory metadata: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -774,6 +988,7 @@ impl Filesystem for Ccfs {
         }
 
         let name = name.to_string_lossy().into_owned();
+
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -787,6 +1002,7 @@ impl Filesystem for Ccfs {
         }
 
         let ino_value = state.next_ino;
+
         state.next_ino += 1;
 
         let now = SystemTime::now();
@@ -805,21 +1021,81 @@ impl Filesystem for Ccfs {
 
         let attr = entry_attr(&entry);
 
-        // Every regular file, including a zero-byte file, receives
-        // an actual persistent block and checksum immediately.
-        if let Err(err) = storage::save_file_data(ino_value, &[]) {
-            eprintln!("Failed to initialize empty file storage: {}", err);
+        /*
+         * REDO journal ordering:
+         *
+         * 1. BEGIN + full intended CREATE payload
+         * 2. fsync journal
+         * 3. COMMIT
+         * 4. fsync journal
+         * 5. Apply data + metadata
+         * 6. Mark transaction applied
+         *
+         * A crash before COMMIT means recovery ignores the tx.
+         * A crash after COMMIT means recovery replays CREATE.
+         */
+
+        let payload = encode_create_payload(&entry);
+
+        let txid = match journal::begin_transaction("CREATE", &payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed to write CREATE BEGIN record: {}", err);
+
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed to write CREATE COMMIT record: {}", err);
+
+            /*
+             * BEGIN remains incomplete.
+             * Recovery will ignore it.
+             */
+
             reply.error(Errno::EIO);
             return;
         }
 
-        if let Err(err) = persist_entry(&entry) {
-            // Avoid leaving an orphan block if metadata insertion fails.
-            let _ = storage::delete_file_data(ino_value);
+        let replay_payload = CreateJournalPayload {
+            ino: ino_value,
+            parent: u64::from(parent),
+            name: name.clone(),
+            perm: entry.perm,
+            atime: system_time_to_timestamp(entry.atime),
+            mtime: system_time_to_timestamp(entry.mtime),
+            ctime: system_time_to_timestamp(entry.ctime),
+        };
 
-            eprintln!("Failed to persist file metadata: {}", err);
+        if let Err(err) = apply_create_payload(&replay_payload) {
+            /*
+             * Transaction is committed but not fully applied.
+             * Do not mark it applied.
+             *
+             * Startup recovery will retry it.
+             */
+            eprintln!(
+                "Committed CREATE transaction {} could not be applied: {}",
+                txid, err
+            );
+
             reply.error(Errno::EIO);
             return;
+        }
+
+        /*
+         * applied_tx is an optimization/idempotency marker.
+         * If this marker write fails, the operation itself is still
+         * durable and replay-safe. A later restart may replay it once.
+         */
+        if let Err(err) = recovery::mark_transaction_applied(txid) {
+            eprintln!(
+                "Warning: CREATE transaction {} applied but applied_tx marker failed: {}",
+                txid, err
+            );
         }
 
         state.entries.insert(ino_value, entry);
@@ -840,6 +1116,7 @@ impl Filesystem for Ccfs {
         }
 
         let name = name.to_string_lossy().into_owned();
+
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -869,12 +1146,14 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = storage::delete_file_data(ino_value) {
             eprintln!("Failed to delete file contents: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
 
         if let Err(err) = db::delete_entry_metadata(ino_value) {
             eprintln!("Failed to delete file metadata: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -891,6 +1170,7 @@ impl Filesystem for Ccfs {
         }
 
         let name = name.to_string_lossy().into_owned();
+
         let mut state = self.state.lock().unwrap();
 
         if let Err(err) = check_directory(&state, parent) {
@@ -926,6 +1206,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = db::delete_entry_metadata(ino_value) {
             eprintln!("Failed to delete directory metadata: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -961,6 +1242,7 @@ impl Filesystem for Ccfs {
         }
 
         let old_name = name.to_string_lossy().into_owned();
+
         let new_name = newname.to_string_lossy().into_owned();
 
         let mut state = self.state.lock().unwrap();
@@ -1012,19 +1294,26 @@ impl Filesystem for Ccfs {
         };
 
         let old_parent = entry.parent;
+
         let old_entry_name = entry.name.clone();
+
         let old_ctime = entry.ctime;
 
         entry.parent = newparent;
+
         entry.name = new_name;
+
         entry.ctime = SystemTime::now();
 
         if let Err(err) = persist_entry(entry) {
             entry.parent = old_parent;
+
             entry.name = old_entry_name;
+
             entry.ctime = old_ctime;
 
             eprintln!("Failed to persist rename: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -1059,6 +1348,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = persist_entry(entry) {
             eprintln!("Failed to persist access time: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -1100,6 +1390,7 @@ impl Filesystem for Ccfs {
         }
 
         let start = offset as usize;
+
         let end = start + data.len();
 
         if entry.data.len() < start {
@@ -1113,17 +1404,20 @@ impl Filesystem for Ccfs {
         entry.data[start..end].copy_from_slice(data);
 
         let now = SystemTime::now();
+
         entry.mtime = now;
         entry.ctime = now;
 
         if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
             eprintln!("Failed to persist file contents: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
 
         if let Err(err) = persist_entry(entry) {
             eprintln!("Failed to update file metadata: {}", err);
+
             reply.error(Errno::EIO);
             return;
         }
@@ -1169,6 +1463,11 @@ fn main() {
                 return;
             }
 
+            "--recovery-status" => {
+                show_recovery_status();
+                return;
+            }
+
             "--help" | "-h" => {
                 print_usage();
                 return;
@@ -1176,8 +1475,11 @@ fn main() {
 
             unknown => {
                 eprintln!("Unknown argument: {}", unknown);
+
                 eprintln!();
+
                 print_usage();
+
                 process::exit(2);
             }
         }
@@ -1186,6 +1488,39 @@ fn main() {
     let _db = db::init_database().expect("Failed to initialize SQLite database");
 
     println!("SQLite metadata database ready.");
+
+    println!("CCFS journal recovery starting...");
+
+    let recovery_summary = match run_startup_recovery() {
+        Ok(summary) => summary,
+
+        Err(err) => {
+            eprintln!("CCFS recovery failed: {}", err);
+
+            process::exit(1);
+        }
+    };
+
+    println!("Journal recovery completed.");
+
+    println!(
+        "  total transactions: {}",
+        recovery_summary.total_transactions
+    );
+
+    println!("  committed: {}", recovery_summary.committed_transactions);
+
+    println!(
+        "  incomplete ignored: {}",
+        recovery_summary.incomplete_transactions
+    );
+
+    println!("  replayed: {}", recovery_summary.replayed_transactions);
+
+    println!(
+        "  already applied: {}",
+        recovery_summary.already_applied_transactions
+    );
 
     let mountpoint = "mount";
 
