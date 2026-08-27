@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rusqlite::{Connection, Result};
 
 #[derive(Debug)]
@@ -8,6 +10,55 @@ pub struct EntryMetadata {
     pub is_dir: bool,
     pub perm: u16,
     pub size: u64,
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+}
+
+fn now_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn column_exists(conn: &Connection, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(entries)")?;
+
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn ensure_timestamp_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "atime")? {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN atime INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    if !column_exists(conn, "mtime")? {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN mtime INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    if !column_exists(conn, "ctime")? {
+        conn.execute(
+            "ALTER TABLE entries ADD COLUMN ctime INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    Ok(())
 }
 
 pub fn init_database() -> Result<Connection> {
@@ -24,6 +75,9 @@ pub fn init_database() -> Result<Connection> {
             kind INTEGER NOT NULL,
             perm INTEGER NOT NULL,
             size INTEGER NOT NULL DEFAULT 0,
+            atime INTEGER NOT NULL DEFAULT 0,
+            mtime INTEGER NOT NULL DEFAULT 0,
+            ctime INTEGER NOT NULL DEFAULT 0,
             UNIQUE(parent, name)
         );
 
@@ -31,6 +85,8 @@ pub fn init_database() -> Result<Connection> {
         ON entries(parent);
         ",
     )?;
+
+    ensure_timestamp_columns(&conn)?;
 
     let old_table_exists: i64 = conn.query_row(
         "
@@ -46,34 +102,53 @@ pub fn init_database() -> Result<Connection> {
     )?;
 
     if old_table_exists != 0 {
-        conn.execute_batch(
+        let now = now_timestamp();
+
+        conn.execute(
             "
             INSERT OR IGNORE INTO entries
-                (ino, parent, name, kind, perm, size)
+                (
+                    ino,
+                    parent,
+                    name,
+                    kind,
+                    perm,
+                    size,
+                    atime,
+                    mtime,
+                    ctime
+                )
             SELECT
                 ino,
                 1,
                 name,
                 0,
                 perm,
-                size
-            FROM files;
-
-            DROP TABLE files;
+                size,
+                ?1,
+                ?1,
+                ?1
+            FROM files
             ",
+            rusqlite::params![now],
         )?;
+
+        conn.execute_batch("DROP TABLE files;")?;
     }
 
     Ok(conn)
 }
 
-pub fn save_entry_metadata(
+pub fn save_entry_metadata_with_times(
     ino: u64,
     parent: u64,
     name: &str,
     is_dir: bool,
     perm: u16,
     size: u64,
+    atime: i64,
+    mtime: i64,
+    ctime: i64,
 ) -> Result<()> {
     let conn = Connection::open("volume/metadata.db")?;
 
@@ -82,16 +157,29 @@ pub fn save_entry_metadata(
     conn.execute(
         "
         INSERT INTO entries
-            (ino, parent, name, kind, perm, size)
+            (
+                ino,
+                parent,
+                name,
+                kind,
+                perm,
+                size,
+                atime,
+                mtime,
+                ctime
+            )
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6)
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 
         ON CONFLICT(ino) DO UPDATE SET
             parent = excluded.parent,
             name   = excluded.name,
             kind   = excluded.kind,
             perm   = excluded.perm,
-            size   = excluded.size
+            size   = excluded.size,
+            atime  = excluded.atime,
+            mtime  = excluded.mtime,
+            ctime  = excluded.ctime
         ",
         rusqlite::params![
             ino as i64,
@@ -100,6 +188,9 @@ pub fn save_entry_metadata(
             kind,
             perm as i64,
             size as i64,
+            atime,
+            mtime,
+            ctime,
         ],
     )?;
 
@@ -117,7 +208,10 @@ pub fn load_entries() -> Result<Vec<EntryMetadata>> {
             name,
             kind,
             perm,
-            size
+            size,
+            atime,
+            mtime,
+            ctime
         FROM entries
         ORDER BY ino
         ",
@@ -133,6 +227,9 @@ pub fn load_entries() -> Result<Vec<EntryMetadata>> {
             is_dir: kind != 0,
             perm: row.get::<_, i64>(4)? as u16,
             size: row.get::<_, i64>(5)? as u64,
+            atime: row.get(6)?,
+            mtime: row.get(7)?,
+            ctime: row.get(8)?,
         })
     })?;
 
@@ -151,22 +248,6 @@ pub fn delete_entry_metadata(ino: u64) -> Result<()> {
     conn.execute(
         "DELETE FROM entries WHERE ino = ?1",
         rusqlite::params![ino as i64],
-    )?;
-
-    Ok(())
-}
-
-pub fn rename_entry_metadata(ino: u64, new_parent: u64, new_name: &str) -> Result<()> {
-    let conn = Connection::open("volume/metadata.db")?;
-
-    conn.execute(
-        "
-        UPDATE entries
-        SET parent = ?1,
-            name = ?2
-        WHERE ino = ?3
-        ",
-        rusqlite::params![new_parent as i64, new_name, ino as i64,],
     )?;
 
     Ok(())

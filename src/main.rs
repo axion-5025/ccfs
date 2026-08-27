@@ -21,6 +21,9 @@ struct MemoryEntry {
     is_dir: bool,
     data: Vec<u8>,
     perm: u16,
+    atime: SystemTime,
+    mtime: SystemTime,
+    ctime: SystemTime,
 }
 
 struct State {
@@ -32,11 +35,53 @@ struct Ccfs {
     state: Mutex<State>,
 }
 
+fn timestamp_to_system_time(timestamp: i64) -> SystemTime {
+    if timestamp <= 0 {
+        UNIX_EPOCH
+    } else {
+        UNIX_EPOCH + Duration::from_secs(timestamp as u64)
+    }
+}
+
+fn system_time_to_timestamp(time: SystemTime) -> i64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn resolve_time(value: TimeOrNow) -> SystemTime {
+    match value {
+        TimeOrNow::Now => SystemTime::now(),
+        TimeOrNow::SpecificTime(time) => time,
+    }
+}
+
+fn persist_entry(entry: &MemoryEntry) -> rusqlite::Result<()> {
+    let size = if entry.is_dir {
+        0
+    } else {
+        entry.data.len() as u64
+    };
+
+    db::save_entry_metadata_with_times(
+        u64::from(entry.ino),
+        u64::from(entry.parent),
+        &entry.name,
+        entry.is_dir,
+        entry.perm,
+        size,
+        system_time_to_timestamp(entry.atime),
+        system_time_to_timestamp(entry.mtime),
+        system_time_to_timestamp(entry.ctime),
+    )
+}
+
 impl Ccfs {
     fn new() -> Self {
         let mut entries = BTreeMap::new();
 
-        // Built-in demo file.
+        let now = SystemTime::now();
+
         entries.insert(
             2,
             MemoryEntry {
@@ -46,6 +91,9 @@ impl Ccfs {
                 is_dir: false,
                 data: b"Hello from CCFS!\n".to_vec(),
                 perm: 0o644,
+                atime: now,
+                mtime: now,
+                ctime: now,
             },
         );
 
@@ -76,6 +124,9 @@ impl Ccfs {
                             is_dir: meta.is_dir,
                             data,
                             perm: meta.perm,
+                            atime: timestamp_to_system_time(meta.atime),
+                            mtime: timestamp_to_system_time(meta.mtime),
+                            ctime: timestamp_to_system_time(meta.ctime),
                         },
                     );
                 }
@@ -131,10 +182,10 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
         ino: entry.ino,
         size,
         blocks: (size + 511) / 512,
-        atime: UNIX_EPOCH,
-        mtime: UNIX_EPOCH,
-        ctime: UNIX_EPOCH,
-        crtime: UNIX_EPOCH,
+        atime: entry.atime,
+        mtime: entry.mtime,
+        ctime: entry.ctime,
+        crtime: entry.ctime,
         kind: entry_kind(entry),
         perm: entry.perm,
         nlink: if entry.is_dir { 2 } else { 1 },
@@ -241,9 +292,9 @@ impl Filesystem for Ccfs {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
@@ -263,8 +314,13 @@ impl Filesystem for Ccfs {
             return;
         };
 
+        let mut changed = false;
+        let mut change_ctime = false;
+
         if let Some(mode) = mode {
             entry.perm = (mode & 0o777) as u16;
+            changed = true;
+            change_ctime = true;
         }
 
         if let Some(size) = size {
@@ -275,6 +331,12 @@ impl Filesystem for Ccfs {
 
             entry.data.resize(size as usize, 0);
 
+            let now = SystemTime::now();
+            entry.mtime = now;
+
+            changed = true;
+            change_ctime = true;
+
             if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
                 eprintln!("Failed to persist resized file: {}", err);
                 reply.error(Errno::EIO);
@@ -282,23 +344,34 @@ impl Filesystem for Ccfs {
             }
         }
 
-        let metadata_size = if entry.is_dir {
-            0
-        } else {
-            entry.data.len() as u64
-        };
+        if let Some(value) = atime {
+            entry.atime = resolve_time(value);
+            changed = true;
+        }
 
-        if let Err(err) = db::save_entry_metadata(
-            u64::from(entry.ino),
-            u64::from(entry.parent),
-            &entry.name,
-            entry.is_dir,
-            entry.perm,
-            metadata_size,
-        ) {
-            eprintln!("Failed to update metadata: {}", err);
-            reply.error(Errno::EIO);
-            return;
+        if let Some(value) = mtime {
+            entry.mtime = resolve_time(value);
+            changed = true;
+            change_ctime = true;
+        }
+
+        let explicit_ctime = ctime.is_some();
+
+        if let Some(value) = ctime {
+            entry.ctime = value;
+            changed = true;
+        }
+
+        if change_ctime && !explicit_ctime {
+            entry.ctime = SystemTime::now();
+        }
+
+        if changed {
+            if let Err(err) = persist_entry(entry) {
+                eprintln!("Failed to update metadata: {}", err);
+                reply.error(Errno::EIO);
+                return;
+            }
         }
 
         reply.attr(&TTL, &entry_attr(entry));
@@ -329,7 +402,7 @@ impl Filesystem for Ccfs {
                 .unwrap_or(INodeNo::ROOT)
         };
 
-        let mut entries: Vec<(INodeNo, FileType, String)> = vec![
+        let mut directory_entries: Vec<(INodeNo, FileType, String)> = vec![
             (ino, FileType::Directory, ".".to_string()),
             (parent_ino, FileType::Directory, "..".to_string()),
         ];
@@ -343,10 +416,10 @@ impl Filesystem for Ccfs {
         children.sort_by(|a, b| a.name.cmp(&b.name));
 
         for child in children {
-            entries.push((child.ino, entry_kind(child), child.name.clone()));
+            directory_entries.push((child.ino, entry_kind(child), child.name.clone()));
         }
 
-        for (index, entry) in entries.iter().enumerate().skip(offset as usize) {
+        for (index, entry) in directory_entries.iter().enumerate().skip(offset as usize) {
             if reply.add(entry.0, (index + 1) as u64, entry.1, &entry.2) {
                 break;
             }
@@ -381,6 +454,8 @@ impl Filesystem for Ccfs {
         let ino_value = state.next_ino;
         state.next_ino += 1;
 
+        let now = SystemTime::now();
+
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
             parent,
@@ -388,13 +463,14 @@ impl Filesystem for Ccfs {
             is_dir: true,
             data: Vec::new(),
             perm: (mode & !umask & 0o777) as u16,
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
 
         let attr = entry_attr(&entry);
 
-        if let Err(err) =
-            db::save_entry_metadata(ino_value, u64::from(parent), &name, true, entry.perm, 0)
-        {
+        if let Err(err) = persist_entry(&entry) {
             eprintln!("Failed to persist directory metadata: {}", err);
             reply.error(Errno::EIO);
             return;
@@ -432,6 +508,8 @@ impl Filesystem for Ccfs {
         let ino_value = state.next_ino;
         state.next_ino += 1;
 
+        let now = SystemTime::now();
+
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
             parent,
@@ -439,13 +517,14 @@ impl Filesystem for Ccfs {
             is_dir: false,
             data: Vec::new(),
             perm: (mode & !umask & 0o777) as u16,
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
 
         let attr = entry_attr(&entry);
 
-        if let Err(err) =
-            db::save_entry_metadata(ino_value, u64::from(parent), &name, false, entry.perm, 0)
-        {
+        if let Err(err) = persist_entry(&entry) {
             eprintln!("Failed to persist file metadata: {}", err);
             reply.error(Errno::EIO);
             return;
@@ -617,19 +696,28 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        if let Err(err) = db::rename_entry_metadata(ino_value, u64::from(newparent), &new_name) {
-            eprintln!("Failed to persist rename: {}", err);
-            reply.error(Errno::EIO);
-            return;
-        }
-
         let Some(entry) = state.entries.get_mut(&ino_value) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
+        let old_parent = entry.parent;
+        let old_entry_name = entry.name.clone();
+        let old_ctime = entry.ctime;
+
         entry.parent = newparent;
         entry.name = new_name;
+        entry.ctime = SystemTime::now();
+
+        if let Err(err) = persist_entry(entry) {
+            entry.parent = old_parent;
+            entry.name = old_entry_name;
+            entry.ctime = old_ctime;
+
+            eprintln!("Failed to persist rename: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
 
         reply.ok();
     }
@@ -645,15 +733,23 @@ impl Filesystem for Ccfs {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
 
-        let Some(entry) = state.entries.get(&u64::from(ino)) else {
+        let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
+            return;
+        }
+
+        entry.atime = SystemTime::now();
+
+        if let Err(err) = persist_entry(entry) {
+            eprintln!("Failed to persist access time: {}", err);
+            reply.error(Errno::EIO);
             return;
         }
 
@@ -706,20 +802,18 @@ impl Filesystem for Ccfs {
 
         entry.data[start..end].copy_from_slice(data);
 
+        let now = SystemTime::now();
+
+        entry.mtime = now;
+        entry.ctime = now;
+
         if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
             eprintln!("Failed to persist file contents: {}", err);
             reply.error(Errno::EIO);
             return;
         }
 
-        if let Err(err) = db::save_entry_metadata(
-            u64::from(entry.ino),
-            u64::from(entry.parent),
-            &entry.name,
-            false,
-            entry.perm,
-            entry.data.len() as u64,
-        ) {
+        if let Err(err) = persist_entry(entry) {
             eprintln!("Failed to update file metadata: {}", err);
             reply.error(Errno::EIO);
             return;
@@ -764,10 +858,7 @@ fn main() {
         .mount_options
         .push(MountOption::FSName("ccfs".to_string()));
 
-    println!(
-        "CCFS directory-aware filesystem mounting at: {}",
-        mountpoint
-    );
+    println!("CCFS metadata-aware filesystem mounting at: {}", mountpoint);
 
     println!("Press Ctrl+C to stop the filesystem.");
 
