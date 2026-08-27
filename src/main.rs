@@ -133,6 +133,40 @@ fn resolve_time(value: TimeOrNow) -> SystemTime {
     }
 }
 
+/*
+ * Test-only deterministic SIGKILL failpoint.
+ *
+ * Example:
+ *
+ * CCFS_KILL9_OPERATION=WRITE
+ * CCFS_KILL9_POINT=after_commit
+ *
+ * This is inactive during normal execution.
+ */
+fn maybe_kill9(operation: &str, point: &str) {
+    let configured_operation = env::var("CCFS_KILL9_OPERATION").ok();
+
+    let configured_point = env::var("CCFS_KILL9_POINT").ok();
+
+    if configured_operation.as_deref() == Some(operation)
+        && configured_point.as_deref() == Some(point)
+    {
+        eprintln!(
+            "CCFS TEST FAILPOINT: SIGKILL operation={} point={}",
+            operation, point
+        );
+
+        let pid = process::id().to_string();
+
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid)
+            .status();
+
+        process::abort();
+    }
+}
+
 fn persist_entry(entry: &MemoryEntry) -> rusqlite::Result<()> {
     let size = if entry.is_dir {
         0
@@ -162,7 +196,9 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
     }
 
     let mut output = [0u8; N];
+
     output.copy_from_slice(&payload[*cursor..*cursor + N]);
+
     *cursor += N;
 
     Ok(output)
@@ -179,13 +215,21 @@ fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     let mut payload = Vec::new();
 
     payload.extend_from_slice(CREATE_PAYLOAD_MAGIC);
+
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
+
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
+
     payload.extend_from_slice(&entry.perm.to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.mtime).to_le_bytes());
+
     payload.extend_from_slice(&system_time_to_timestamp(entry.ctime).to_le_bytes());
+
     payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+
     payload.extend_from_slice(name_bytes);
 
     payload
@@ -209,10 +253,15 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     let mut cursor = CREATE_PAYLOAD_MAGIC.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
+
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -279,15 +328,25 @@ fn encode_write_payload(payload: &WriteJournalPayload) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
 
     output.extend_from_slice(WRITE_PAYLOAD_MAGIC);
+
     output.extend_from_slice(&payload.ino.to_le_bytes());
+
     output.extend_from_slice(&payload.parent.to_le_bytes());
+
     output.extend_from_slice(&payload.perm.to_le_bytes());
+
     output.extend_from_slice(&payload.atime.to_le_bytes());
+
     output.extend_from_slice(&payload.mtime.to_le_bytes());
+
     output.extend_from_slice(&payload.ctime.to_le_bytes());
+
     output.extend_from_slice(&name_length.to_le_bytes());
+
     output.extend_from_slice(&data_length.to_le_bytes());
+
     output.extend_from_slice(name_bytes);
+
     output.extend_from_slice(&payload.data);
 
     Ok(output)
@@ -393,17 +452,25 @@ fn encode_rename_payload(payload: &RenameJournalPayload) -> io::Result<Vec<u8>> 
     let mut output = Vec::new();
 
     output.extend_from_slice(RENAME_PAYLOAD_MAGIC);
+
     output.extend_from_slice(&payload.ino.to_le_bytes());
+
     output.extend_from_slice(&payload.new_parent.to_le_bytes());
 
     output.push(if payload.is_dir { 1 } else { 0 });
 
     output.extend_from_slice(&payload.perm.to_le_bytes());
+
     output.extend_from_slice(&payload.size.to_le_bytes());
+
     output.extend_from_slice(&payload.atime.to_le_bytes());
+
     output.extend_from_slice(&payload.mtime.to_le_bytes());
+
     output.extend_from_slice(&payload.ctime.to_le_bytes());
+
     output.extend_from_slice(&name_length.to_le_bytes());
+
     output.extend_from_slice(name_bytes);
 
     Ok(output)
@@ -545,7 +612,7 @@ fn remove_file_storage_idempotent(ino: u64) -> io::Result<()> {
             Ok(()) => {}
 
             Err(err) if err.kind() == ErrorKind::NotFound => {
-                // Already removed.
+                // Already deleted.
             }
 
             Err(err) => {
@@ -558,13 +625,6 @@ fn remove_file_storage_idempotent(ino: u64) -> io::Result<()> {
 }
 
 fn apply_delete_payload(txid: u64, payload: &DeleteJournalPayload) -> io::Result<()> {
-    /*
-     * DELETE replay is idempotent.
-     *
-     * A crash may happen after .bin removal, checksum removal,
-     * or before SQLite metadata commit. Replaying safely
-     * converges to the same final state.
-     */
     remove_file_storage_idempotent(payload.ino)?;
 
     db::delete_entry_metadata_and_mark_tx(txid, payload.ino).map_err(database_io_error)?;
@@ -611,7 +671,7 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
 }
 
 /* ============================================================
- * STATE LOAD
+ * STATE
  * ============================================================
  */
 
@@ -625,13 +685,21 @@ impl Ccfs {
             2,
             MemoryEntry {
                 ino: INodeNo(2),
+
                 parent: INodeNo::ROOT,
+
                 name: "hello.txt".to_string(),
+
                 is_dir: false,
+
                 data: b"Hello from CCFS!\n".to_vec(),
+
                 perm: 0o644,
+
                 atime: now,
+
                 mtime: now,
+
                 ctime: now,
             },
         );
@@ -723,19 +791,33 @@ impl Ccfs {
 fn root_attr() -> FileAttr {
     FileAttr {
         ino: INodeNo::ROOT,
+
         size: 0,
+
         blocks: 0,
+
         atime: UNIX_EPOCH,
+
         mtime: UNIX_EPOCH,
+
         ctime: UNIX_EPOCH,
+
         crtime: UNIX_EPOCH,
+
         kind: FileType::Directory,
+
         perm: 0o755,
+
         nlink: 2,
+
         uid: 1000,
+
         gid: 1000,
+
         rdev: 0,
+
         blksize: 4096,
+
         flags: 0,
     }
 }
@@ -757,19 +839,33 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
 
     FileAttr {
         ino: entry.ino,
+
         size,
+
         blocks: (size + 511) / 512,
+
         atime: entry.atime,
+
         mtime: entry.mtime,
+
         ctime: entry.ctime,
+
         crtime: entry.ctime,
+
         kind: entry_kind(entry),
+
         perm: entry.perm,
+
         nlink: if entry.is_dir { 2 } else { 1 },
+
         uid: 1000,
+
         gid: 1000,
+
         rdev: 0,
+
         blksize: 4096,
+
         flags: 0,
     }
 }
@@ -825,7 +921,7 @@ fn would_create_directory_cycle(state: &State, moving_ino: u64, new_parent: INod
 }
 
 /* ============================================================
- * ADMIN COMMANDS
+ * ADMIN
  * ============================================================
  */
 
@@ -1084,7 +1180,7 @@ fn print_usage() {
 }
 
 /* ============================================================
- * FUSE FILESYSTEM
+ * FILESYSTEM
  * ============================================================
  */
 
@@ -1170,12 +1266,14 @@ impl Filesystem for Ccfs {
         };
 
         let mut changed = false;
+
         let mut change_ctime = false;
 
         if let Some(mode) = mode {
             entry.perm = (mode & 0o777) as u16;
 
             changed = true;
+
             change_ctime = true;
         }
 
@@ -1193,6 +1291,7 @@ impl Filesystem for Ccfs {
             entry.mtime = now;
 
             changed = true;
+
             change_ctime = true;
 
             if let Err(err) = storage::save_file_data(u64::from(entry.ino), &entry.data) {
@@ -1214,6 +1313,7 @@ impl Filesystem for Ccfs {
             entry.mtime = resolve_time(value);
 
             changed = true;
+
             change_ctime = true;
         }
 
@@ -1221,6 +1321,7 @@ impl Filesystem for Ccfs {
 
         if let Some(value) = ctime {
             entry.ctime = value;
+
             changed = true;
         }
 
@@ -1434,6 +1535,8 @@ impl Filesystem for Ccfs {
             }
         };
 
+        maybe_kill9("CREATE", "after_begin");
+
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed CREATE COMMIT: {}", err);
 
@@ -1441,6 +1544,8 @@ impl Filesystem for Ccfs {
 
             return;
         }
+
+        maybe_kill9("CREATE", "after_commit");
 
         let payload = CreateJournalPayload {
             ino: ino_value,
@@ -1532,6 +1637,8 @@ impl Filesystem for Ccfs {
             }
         };
 
+        maybe_kill9("DELETE", "after_begin");
+
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed DELETE COMMIT: {}", err);
 
@@ -1539,6 +1646,8 @@ impl Filesystem for Ccfs {
 
             return;
         }
+
+        maybe_kill9("DELETE", "after_commit");
 
         if let Err(err) = apply_delete_payload(txid, &delete_payload) {
             eprintln!("Committed DELETE {} apply failed: {}", txid, err);
@@ -1738,6 +1847,8 @@ impl Filesystem for Ccfs {
             }
         };
 
+        maybe_kill9("RENAME", "after_begin");
+
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed RENAME COMMIT: {}", err);
 
@@ -1745,6 +1856,8 @@ impl Filesystem for Ccfs {
 
             return;
         }
+
+        maybe_kill9("RENAME", "after_commit");
 
         if let Err(err) = apply_rename_payload(txid, &rename_payload) {
             eprintln!("Committed RENAME {} apply failed: {}", txid, err);
@@ -1808,6 +1921,7 @@ impl Filesystem for Ccfs {
 
         if start >= entry.data.len() {
             reply.data(&[]);
+
             return;
         }
 
@@ -1918,6 +2032,8 @@ impl Filesystem for Ccfs {
             }
         };
 
+        maybe_kill9("WRITE", "after_begin");
+
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed WRITE COMMIT: {}", err);
 
@@ -1925,6 +2041,8 @@ impl Filesystem for Ccfs {
 
             return;
         }
+
+        maybe_kill9("WRITE", "after_commit");
 
         if let Err(err) = apply_write_payload(txid, &payload) {
             eprintln!("Committed WRITE {} apply failed: {}", txid, err);
