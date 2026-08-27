@@ -6,6 +6,7 @@ mod storage;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::io::{self, ErrorKind};
 use std::os::unix::ffi::OsStrExt;
 use std::process;
@@ -26,6 +27,7 @@ const NAME_MAX: usize = 255;
 const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
 const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
 const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
+const DELETE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSDEL1";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -98,6 +100,11 @@ struct RenameJournalPayload {
     ctime: i64,
 }
 
+#[derive(Debug)]
+struct DeleteJournalPayload {
+    ino: u64,
+}
+
 fn database_io_error(error: rusqlite::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::Other,
@@ -156,7 +163,6 @@ fn read_array<const N: usize>(payload: &[u8], cursor: &mut usize) -> io::Result<
 
     let mut output = [0u8; N];
     output.copy_from_slice(&payload[*cursor..*cursor + N]);
-
     *cursor += N;
 
     Ok(output)
@@ -176,15 +182,10 @@ fn encode_create_payload(entry: &MemoryEntry) -> Vec<u8> {
     payload.extend_from_slice(&u64::from(entry.ino).to_le_bytes());
     payload.extend_from_slice(&u64::from(entry.parent).to_le_bytes());
     payload.extend_from_slice(&entry.perm.to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.atime).to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.mtime).to_le_bytes());
-
     payload.extend_from_slice(&system_time_to_timestamp(entry.ctime).to_le_bytes());
-
     payload.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-
     payload.extend_from_slice(name_bytes);
 
     payload
@@ -208,15 +209,10 @@ fn decode_create_payload(payload: &[u8]) -> io::Result<CreateJournalPayload> {
     let mut cursor = CREATE_PAYLOAD_MAGIC.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
-
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -500,6 +496,83 @@ fn apply_rename_payload(txid: u64, payload: &RenameJournalPayload) -> io::Result
 }
 
 /* ============================================================
+ * DELETE JOURNAL
+ * ============================================================
+ */
+
+fn encode_delete_payload(payload: &DeleteJournalPayload) -> Vec<u8> {
+    let mut output = Vec::with_capacity(DELETE_PAYLOAD_MAGIC.len() + 8);
+
+    output.extend_from_slice(DELETE_PAYLOAD_MAGIC);
+
+    output.extend_from_slice(&payload.ino.to_le_bytes());
+
+    output
+}
+
+fn decode_delete_payload(payload: &[u8]) -> io::Result<DeleteJournalPayload> {
+    let expected_length = DELETE_PAYLOAD_MAGIC.len() + 8;
+
+    if payload.len() != expected_length {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DELETE payload has invalid length",
+        ));
+    }
+
+    if &payload[..DELETE_PAYLOAD_MAGIC.len()] != DELETE_PAYLOAD_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid DELETE payload magic",
+        ));
+    }
+
+    let mut cursor = DELETE_PAYLOAD_MAGIC.len();
+
+    let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    Ok(DeleteJournalPayload { ino })
+}
+
+fn remove_file_storage_idempotent(ino: u64) -> io::Result<()> {
+    let paths = [
+        format!("volume/blocks/{ino}.bin"),
+        format!("volume/blocks/{ino}.checksum"),
+    ];
+
+    for path in paths {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                // Already removed.
+            }
+
+            Err(err) => {
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_delete_payload(txid: u64, payload: &DeleteJournalPayload) -> io::Result<()> {
+    /*
+     * DELETE replay is idempotent.
+     *
+     * A crash may happen after .bin removal, checksum removal,
+     * or before SQLite metadata commit. Replaying safely
+     * converges to the same final state.
+     */
+    remove_file_storage_idempotent(payload.ino)?;
+
+    db::delete_entry_metadata_and_mark_tx(txid, payload.ino).map_err(database_io_error)?;
+
+    Ok(())
+}
+
+/* ============================================================
  * STARTUP RECOVERY
  * ============================================================
  */
@@ -522,6 +595,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             let payload = decode_rename_payload(&transaction.payload)?;
 
             apply_rename_payload(transaction.txid, &payload)
+        }
+
+        "DELETE" => {
+            let payload = decode_delete_payload(&transaction.payload)?;
+
+            apply_delete_payload(transaction.txid, &payload)
         }
 
         other => Err(io::Error::new(
@@ -762,6 +841,7 @@ fn migrate_checksums() {
     };
 
     println!("CCFS checksum migration");
+
     println!("-----------------------");
 
     let entries = match db::load_entries() {
@@ -844,6 +924,7 @@ fn migrate_checksums() {
     };
 
     println!();
+
     println!("Migration completed.");
 
     println!("Legacy empty blocks repaired: {}", repaired_empty_files);
@@ -863,6 +944,7 @@ fn check_integrity() {
     };
 
     println!("CCFS integrity check");
+
     println!("--------------------");
 
     let entries = match db::load_entries() {
@@ -1088,7 +1170,6 @@ impl Filesystem for Ccfs {
         };
 
         let mut changed = false;
-
         let mut change_ctime = false;
 
         if let Some(mode) = mode {
@@ -1435,16 +1516,32 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        if let Err(err) = storage::delete_file_data(ino_value) {
-            eprintln!("Failed to delete file contents: {}", err);
+        let delete_payload = DeleteJournalPayload { ino: ino_value };
+
+        let encoded_payload = encode_delete_payload(&delete_payload);
+
+        let txid = match journal::begin_transaction("DELETE", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed DELETE BEGIN: {}", err);
+
+                reply.error(Errno::EIO);
+
+                return;
+            }
+        };
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed DELETE COMMIT: {}", err);
 
             reply.error(Errno::EIO);
 
             return;
         }
 
-        if let Err(err) = db::delete_entry_metadata(ino_value) {
-            eprintln!("Failed to delete file metadata: {}", err);
+        if let Err(err) = apply_delete_payload(txid, &delete_payload) {
+            eprintln!("Committed DELETE {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
 
@@ -1711,7 +1808,6 @@ impl Filesystem for Ccfs {
 
         if start >= entry.data.len() {
             reply.data(&[]);
-
             return;
         }
 

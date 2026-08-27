@@ -213,14 +213,6 @@ pub fn save_entry_metadata_with_times(
     Ok(())
 }
 
-/*
- * Crash-consistency helper.
- *
- * Metadata update and applied_tx insertion happen
- * inside ONE SQLite transaction.
- *
- * Either both become durable or neither does.
- */
 pub fn save_entry_metadata_with_times_and_mark_tx(
     txid: u64,
     ino: u64,
@@ -362,6 +354,45 @@ pub fn delete_entry_metadata(ino: u64) -> Result<()> {
         ",
         rusqlite::params![ino as i64],
     )?;
+
+    Ok(())
+}
+
+/*
+ * Crash-safe DELETE metadata commit.
+ *
+ * Deleting metadata and recording applied_tx happen
+ * in the same SQLite transaction.
+ */
+pub fn delete_entry_metadata_and_mark_tx(txid: u64, ino: u64) -> Result<()> {
+    let mut conn = Connection::open("volume/metadata.db")?;
+
+    conn.pragma_update(None, "synchronous", "FULL")?;
+
+    let tx = conn.transaction()?;
+
+    tx.execute(
+        "
+        DELETE FROM entries
+        WHERE ino = ?1
+        ",
+        rusqlite::params![ino as i64],
+    )?;
+
+    tx.execute(
+        "
+        INSERT OR IGNORE INTO applied_tx
+            (
+                txid,
+                applied_at
+            )
+        VALUES
+            (?1, ?2)
+        ",
+        rusqlite::params![txid as i64, now_timestamp(),],
+    )?;
+
+    tx.commit()?;
 
     Ok(())
 }
