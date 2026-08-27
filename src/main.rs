@@ -1,4 +1,5 @@
 mod db;
+mod storage;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::sync::Mutex;
@@ -52,12 +53,17 @@ impl Ccfs {
 
                     next_ino = next_ino.max(meta.ino + 1);
 
+                    let data = storage::load_file_data(meta.ino)
+                        .unwrap_or_else(|_| vec![0; meta.size as usize]);
+
+                    let name = meta.name.clone();
+
                     files.insert(
-                        meta.name.clone(),
+                        name.clone(),
                         MemoryFile {
                             ino: INodeNo(meta.ino),
-                            name: meta.name,
-                            data: vec![0; meta.size as usize],
+                            name,
+                            data,
                             perm: meta.perm,
                         },
                     );
@@ -346,7 +352,22 @@ impl Filesystem for Ccfs {
         }
 
         file.data[start..end].copy_from_slice(data);
+        if let Err(err) = storage::save_file_data(u64::from(file.ino), &file.data) {
+            eprintln!("Failed to persist file data: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
 
+        if let Err(err) = db::save_file_metadata(
+            u64::from(file.ino),
+            &file.name,
+            file.perm,
+            file.data.len() as u64,
+        ) {
+            eprintln!("Failed to update file metadata: {}", err);
+            reply.error(Errno::EIO);
+            return;
+        }
         reply.written(data.len() as u32);
     }
 
