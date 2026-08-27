@@ -270,7 +270,20 @@ echo "[3/10] Normal journaled CREATE..."
 
 start_ccfs
 
-touch "$MOUNT_DIR/$NORMAL_NAME"
+python3 - "$MOUNT_DIR/$NORMAL_NAME" <<'PYCREATE'
+import os
+import sys
+
+path = sys.argv[1]
+
+fd = os.open(
+    path,
+    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+    0o644,
+)
+
+os.close(fd)
+PYCREATE
 
 [[ -f "$MOUNT_DIR/$NORMAL_NAME" ]] ||
     fail "normal CREATE did not produce file"

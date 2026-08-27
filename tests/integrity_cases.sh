@@ -161,7 +161,7 @@ cp "volume/blocks/$TEST_INODE.checksum" "$CHECKSUM_BACKUP"
 echo
 echo "[3/7] Healthy integrity check..."
 
-cargo run --quiet -- --check-integrity \
+./target/debug/ccfs --check-integrity \
     >/tmp/ccfs-integrity-output.txt 2>&1 ||
     fail "Healthy integrity check unexpectedly failed"
 
@@ -183,7 +183,7 @@ printf 'X' |
         conv=notrunc \
         status=none
 
-if cargo run --quiet -- --check-integrity \
+if ./target/debug/ccfs --check-integrity \
     >/tmp/ccfs-integrity-output.txt 2>&1
 then
     cat /tmp/ccfs-integrity-output.txt
@@ -202,7 +202,7 @@ echo "[5/7] Restoring healthy data..."
 
 cp "$DATA_BACKUP" "volume/blocks/$TEST_INODE.bin"
 
-cargo run --quiet -- --check-integrity \
+./target/debug/ccfs --check-integrity \
     >/tmp/ccfs-integrity-output.txt 2>&1 ||
     fail "Integrity did not recover after restoring data"
 
@@ -213,7 +213,7 @@ echo "[6/7] Missing checksum detection..."
 
 rm "volume/blocks/$TEST_INODE.checksum"
 
-if cargo run --quiet -- --check-integrity \
+if ./target/debug/ccfs --check-integrity \
     >/tmp/ccfs-integrity-output.txt 2>&1
 then
     cat /tmp/ccfs-integrity-output.txt
@@ -234,7 +234,7 @@ cp \
     "$CHECKSUM_BACKUP" \
     "volume/blocks/$TEST_INODE.checksum"
 
-cargo run --quiet -- --check-integrity \
+./target/debug/ccfs --check-integrity \
     >/tmp/ccfs-integrity-output.txt 2>&1 ||
     fail "Final integrity check failed"
 
