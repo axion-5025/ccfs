@@ -34,6 +34,9 @@ TRUNCATE_COMMIT_NAME="k9-truncate-commit-$RUN_ID.txt"
 SETATTR_BEGIN_NAME="k9-setattr-begin-$RUN_ID.txt"
 SETATTR_COMMIT_NAME="k9-setattr-commit-$RUN_ID.txt"
 
+ATIME_BEGIN_NAME="k9-atime-begin-$RUN_ID.txt"
+ATIME_COMMIT_NAME="k9-atime-commit-$RUN_ID.txt"
+
 RENAME_BEGIN_OLD="k9-rename-begin-old-$RUN_ID.txt"
 RENAME_BEGIN_NEW="k9-rename-begin-new-$RUN_ID.txt"
 
@@ -236,6 +239,15 @@ sql_name_perm() {
          WHERE name='$name';"
 }
 
+sql_name_atime() {
+    local name="$1"
+
+    sqlite3 volume/metadata.db \
+        "SELECT atime
+         FROM entries
+         WHERE name='$name';"
+}
+
 assert_file_text() {
     local path="$1"
     local expected="$2"
@@ -346,7 +358,7 @@ echo " CCFS REAL SIGKILL Recovery Test Suite"
 echo "========================================"
 echo
 
-echo "[1/18] Snapshotting original volume and building CCFS..."
+echo "[1/20] Snapshotting original volume and building CCFS..."
 
 snapshot_volume
 
@@ -363,7 +375,7 @@ pass "volume snapshot created and CCFS built"
 # ============================================================
 
 echo
-echo "[2/18] CREATE crash after BEGIN..."
+echo "[2/20] CREATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -399,7 +411,7 @@ pass "CREATE killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[3/18] CREATE crash after COMMIT..."
+echo "[3/20] CREATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -437,7 +449,7 @@ pass "CREATE killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[4/18] MKDIR crash after BEGIN..."
+echo "[4/20] MKDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -473,7 +485,7 @@ pass "MKDIR killed after BEGIN was safely ignored"
 # ============================================================
 
 echo
-echo "[5/18] MKDIR crash after COMMIT..."
+echo "[5/20] MKDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -514,7 +526,7 @@ pass "MKDIR killed after COMMIT recovered successfully"
 # ============================================================
 
 echo
-echo "[6/18] RMDIR crash after BEGIN..."
+echo "[6/20] RMDIR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -561,7 +573,7 @@ pass "RMDIR killed after BEGIN preserved directory"
 # ============================================================
 
 echo
-echo "[7/18] RMDIR crash after COMMIT..."
+echo "[7/20] RMDIR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -613,7 +625,7 @@ pass "RMDIR killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[8/18] WRITE crash after BEGIN..."
+echo "[8/20] WRITE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -689,7 +701,7 @@ pass "WRITE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[9/18] WRITE crash after COMMIT..."
+echo "[9/20] WRITE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -767,7 +779,7 @@ pass "WRITE killed after COMMIT recovered exact data"
 # ============================================================
 
 echo
-echo "[10/18] TRUNCATE crash after BEGIN..."
+echo "[10/20] TRUNCATE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -833,7 +845,7 @@ pass "TRUNCATE killed after BEGIN preserved old data"
 # ============================================================
 
 echo
-echo "[11/18] TRUNCATE crash after COMMIT..."
+echo "[11/20] TRUNCATE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -899,7 +911,7 @@ pass "TRUNCATE killed after COMMIT recovered exact size and data"
 # ============================================================
 
 echo
-echo "[12/18] SETATTR crash after BEGIN..."
+echo "[12/20] SETATTR crash after BEGIN..."
 
 clear_recovery_state
 
@@ -963,7 +975,7 @@ pass "SETATTR killed after BEGIN preserved old metadata"
 # ============================================================
 
 echo
-echo "[13/18] SETATTR crash after COMMIT..."
+echo "[13/20] SETATTR crash after COMMIT..."
 
 clear_recovery_state
 
@@ -1026,11 +1038,136 @@ run_integrity_check
 pass "SETATTR killed after COMMIT recovered metadata"
 
 # ============================================================
+# ATIME — AFTER BEGIN
+# ============================================================
+
+echo
+echo "[14/20] ATIME crash after BEGIN..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "ATIME-BEGIN-DATA" \
+    > "$MOUNT_DIR/$ATIME_BEGIN_NAME"
+
+stop_ccfs
+
+ATIME_BEGIN_OLD="$(
+    sql_name_atime \
+        "$ATIME_BEGIN_NAME"
+)"
+
+[[ -n "$ATIME_BEGIN_OLD" ]] ||
+    fail "ATIME-after-BEGIN setup atime missing"
+
+clear_recovery_state
+
+sleep 2
+
+start_crash_ccfs \
+    "ATIME" \
+    "after_begin"
+
+timeout 5 \
+    cat "$MOUNT_DIR/$ATIME_BEGIN_NAME" \
+    >/dev/null 2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_atime "$ATIME_BEGIN_NAME")" == "$ATIME_BEGIN_OLD" ]] ||
+    fail "ATIME-after-BEGIN changed durable atime"
+
+start_normal_ccfs
+
+[[ -f "$MOUNT_DIR/$ATIME_BEGIN_NAME" ]] ||
+    fail "ATIME-after-BEGIN test file missing after restart"
+
+[[ "$(sql_name_atime "$ATIME_BEGIN_NAME")" == "$ATIME_BEGIN_OLD" ]] ||
+    fail "incomplete ATIME changed atime after restart"
+
+grep -q \
+    "incomplete ignored: 1" \
+    "$RECOVERY_LOG" ||
+    fail "ATIME-after-BEGIN was not classified incomplete"
+
+stop_ccfs
+
+run_integrity_check
+
+pass "ATIME killed after BEGIN preserved old atime"
+
+# ============================================================
+# ATIME — AFTER COMMIT
+# ============================================================
+
+echo
+echo "[15/20] ATIME crash after COMMIT..."
+
+clear_recovery_state
+
+start_normal_ccfs
+
+printf '%s' "ATIME-COMMIT-DATA" \
+    > "$MOUNT_DIR/$ATIME_COMMIT_NAME"
+
+stop_ccfs
+
+ATIME_COMMIT_OLD="$(
+    sql_name_atime \
+        "$ATIME_COMMIT_NAME"
+)"
+
+[[ -n "$ATIME_COMMIT_OLD" ]] ||
+    fail "ATIME-after-COMMIT setup atime missing"
+
+clear_recovery_state
+
+sleep 2
+
+start_crash_ccfs \
+    "ATIME" \
+    "after_commit"
+
+timeout 5 \
+    cat "$MOUNT_DIR/$ATIME_COMMIT_NAME" \
+    >/dev/null 2>/dev/null || true
+
+wait_for_sigkill
+
+[[ "$(sql_name_atime "$ATIME_COMMIT_NAME")" == "$ATIME_COMMIT_OLD" ]] ||
+    fail "ATIME-after-COMMIT applied before intended crash"
+
+start_normal_ccfs
+
+[[ -f "$MOUNT_DIR/$ATIME_COMMIT_NAME" ]] ||
+    fail "ATIME-after-COMMIT test file missing after recovery"
+
+ATIME_COMMIT_RECOVERED="$(
+    sql_name_atime \
+        "$ATIME_COMMIT_NAME"
+)"
+
+[[ "$ATIME_COMMIT_RECOVERED" -gt "$ATIME_COMMIT_OLD" ]] ||
+    fail "committed ATIME was not recovered"
+
+grep -q \
+    "replayed: 1" \
+    "$RECOVERY_LOG" ||
+    fail "committed ATIME did not replay"
+
+stop_ccfs
+
+run_integrity_check
+
+pass "ATIME killed after COMMIT recovered updated atime"
+
+# ============================================================
 # RENAME — AFTER BEGIN
 # ============================================================
 
 echo
-echo "[14/18] RENAME crash after BEGIN..."
+echo "[16/20] RENAME crash after BEGIN..."
 
 clear_recovery_state
 
@@ -1087,7 +1224,7 @@ pass "RENAME killed after BEGIN preserved old namespace"
 # ============================================================
 
 echo
-echo "[15/18] RENAME crash after COMMIT..."
+echo "[17/20] RENAME crash after COMMIT..."
 
 clear_recovery_state
 
@@ -1151,7 +1288,7 @@ pass "RENAME killed after COMMIT recovered namespace"
 # ============================================================
 
 echo
-echo "[16/18] DELETE crash after BEGIN..."
+echo "[18/20] DELETE crash after BEGIN..."
 
 clear_recovery_state
 
@@ -1204,7 +1341,7 @@ pass "DELETE killed after BEGIN preserved file"
 # ============================================================
 
 echo
-echo "[17/18] DELETE crash after COMMIT..."
+echo "[19/20] DELETE crash after COMMIT..."
 
 clear_recovery_state
 
@@ -1266,7 +1403,7 @@ pass "DELETE killed after COMMIT recovered deletion"
 # ============================================================
 
 echo
-echo "[18/18] Final integrity verification..."
+echo "[20/20] Final integrity verification..."
 
 run_integrity_check
 

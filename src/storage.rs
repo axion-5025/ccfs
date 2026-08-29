@@ -1,4 +1,4 @@
-use std::fs;
+use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +10,14 @@ fn data_path(ino: u64) -> PathBuf {
 
 fn checksum_path(ino: u64) -> PathBuf {
     Path::new(BLOCK_DIR).join(format!("{ino}.checksum"))
+}
+
+fn data_temp_path(ino: u64) -> PathBuf {
+    Path::new(BLOCK_DIR).join(format!(".{ino}.bin.tmp"))
+}
+
+fn checksum_temp_path(ino: u64) -> PathBuf {
+    Path::new(BLOCK_DIR).join(format!(".{ino}.checksum.tmp"))
 }
 
 fn checksum(data: &[u8]) -> u64 {
@@ -26,12 +34,48 @@ fn checksum(data: &[u8]) -> u64 {
     hash
 }
 
+fn sync_block_directory() -> io::Result<()> {
+    fs::create_dir_all(BLOCK_DIR)?;
+
+    let directory = File::open(BLOCK_DIR)?;
+
+    directory.sync_all()?;
+
+    Ok(())
+}
+
+fn write_synced_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    fs::write(path, data)?;
+
+    let file = File::open(path)?;
+
+    file.sync_all()?;
+
+    Ok(())
+}
+
 fn write_checksum(ino: u64, data: &[u8]) -> io::Result<()> {
     fs::create_dir_all(BLOCK_DIR)?;
 
     let value = checksum(data);
 
-    fs::write(checksum_path(ino), format!("{value:016x}\n"))?;
+    let final_path = checksum_path(ino);
+    let temp_path = checksum_temp_path(ino);
+
+    let contents = format!("{value:016x}\n");
+
+    write_synced_file(&temp_path, contents.as_bytes())?;
+
+    fs::rename(&temp_path, &final_path)?;
+
+    /*
+     * Persist the checksum rename itself.
+     *
+     * sync_all() on the file protects the file contents,
+     * while syncing the directory protects the filename /
+     * rename operation across a power loss.
+     */
+    sync_block_directory()?;
 
     Ok(())
 }
@@ -47,27 +91,74 @@ fn read_expected_checksum(ino: u64) -> io::Result<u64> {
     })
 }
 
+fn maybe_enospc(point: &str) -> io::Result<()> {
+    let requested = std::env::var("CCFS_ENOSPC_POINT").ok();
+
+    if requested.as_deref() != Some(point) {
+        return Ok(());
+    }
+
+    eprintln!("CCFS ENOSPC failpoint triggered: {}", point);
+
+    Err(io::Error::from_raw_os_error(28))
+}
+
 pub fn save_file_data(ino: u64, data: &[u8]) -> io::Result<()> {
     fs::create_dir_all(BLOCK_DIR)?;
 
     let final_path = data_path(ino);
+    let temp_path = data_temp_path(ino);
 
-    let temp_path = Path::new(BLOCK_DIR).join(format!(".{ino}.bin.tmp"));
+    /*
+     * Write the new data to a temporary file first.
+     *
+     * The temporary file is fully synced before rename so
+     * the final block never points at partially-written data.
+     */
+    maybe_enospc("data_write")?;
 
-    fs::write(&temp_path, data)?;
+    write_synced_file(&temp_path, data)?;
 
-    {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&temp_path)?;
-
-        file.sync_all()?;
-    }
-
+    /*
+     * Atomically publish the new data block.
+     */
     fs::rename(&temp_path, &final_path)?;
 
+    /*
+     * Write and durably publish the checksum.
+     *
+     * write_checksum() also syncs BLOCK_DIR after its rename.
+     * Because the data rename happened in the same directory
+     * before that directory sync, both directory updates are
+     * durable before this function returns.
+     */
     write_checksum(ino, data)?;
+
+    Ok(())
+}
+
+pub fn sync_file_data(ino: u64, data_only: bool) -> io::Result<()> {
+    let data_file = File::open(data_path(ino))?;
+
+    if data_only {
+        data_file.sync_data()?;
+    } else {
+        data_file.sync_all()?;
+    }
+
+    /*
+     * The checksum is required to validate the durable data,
+     * so it must also reach stable storage.
+     */
+    let checksum_file = File::open(checksum_path(ino))?;
+
+    checksum_file.sync_all()?;
+
+    /*
+     * Ensure block/checksum directory entries and renames are
+     * also durable.
+     */
+    sync_block_directory()?;
 
     Ok(())
 }
@@ -86,6 +177,7 @@ pub fn load_file_data(ino: u64) -> io::Result<Vec<u8>> {
      */
     if !checksum_path(ino).exists() {
         write_checksum(ino, &data)?;
+
         return Ok(data);
     }
 
@@ -111,15 +203,29 @@ pub fn delete_file_data(ino: u64) -> io::Result<()> {
 
     match fs::remove_file(&data_file) {
         Ok(()) => {}
+
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+
+        Err(err) => {
+            return Err(err);
+        }
     }
 
     match fs::remove_file(&checksum_file) {
         Ok(()) => {}
+
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+
+        Err(err) => {
+            return Err(err);
+        }
     }
+
+    /*
+     * fsync the directory so deletion of the data/checksum
+     * names survives a power loss.
+     */
+    sync_block_directory()?;
 
     Ok(())
 }

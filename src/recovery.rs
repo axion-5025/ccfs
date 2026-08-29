@@ -27,6 +27,23 @@ pub fn mark_transaction_applied(txid: u64) -> io::Result<()> {
     db::mark_transaction_applied(txid).map_err(database_error)
 }
 
+fn maybe_recovery_kill9(point: &str) {
+    let requested = std::env::var("CCFS_RECOVERY_KILL9_POINT").ok();
+
+    if requested.as_deref() != Some(point) {
+        return;
+    }
+
+    eprintln!("CCFS recovery SIGKILL failpoint triggered: {}", point);
+
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(std::process::id().to_string())
+        .status();
+
+    std::process::abort();
+}
+
 pub fn recover_with<F>(mut replay: F) -> io::Result<RecoverySummary>
 where
     F: FnMut(&JournalTransaction) -> io::Result<()>,
@@ -75,6 +92,8 @@ where
          * The caller decides how CREATE / WRITE / RENAME / DELETE
          * should be restored.
          */
+        maybe_recovery_kill9("before_replay");
+
         replay(&transaction)?;
 
         /*
@@ -86,6 +105,91 @@ where
     }
 
     Ok(summary)
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CheckpointSummary {
+    pub original_transactions: usize,
+    pub retained_transactions: usize,
+    pub removed_applied_transactions: usize,
+    pub removed_incomplete_transactions: usize,
+}
+
+/*
+ * Compact recovery state safely.
+ *
+ * Keep only committed transactions that have NOT yet been applied.
+ *
+ * Safe ordering:
+ *
+ *   1. Inspect journal + applied_tx.
+ *   2. Atomically rewrite journal.
+ *   3. Clear stale applied_tx records.
+ *   4. Checkpoint SQLite WAL.
+ *
+ * If the process crashes before journal replacement, the old journal
+ * remains valid. If it crashes after replacement but before DB cleanup,
+ * stale applied_tx rows are harmless.
+ */
+pub fn checkpoint_recovery_state() -> io::Result<CheckpointSummary> {
+    let _connection = db::init_database().map_err(database_error)?;
+
+    let transactions = crate::journal::load_transactions()?;
+
+    let mut summary = CheckpointSummary {
+        original_transactions: transactions.len(),
+        ..CheckpointSummary::default()
+    };
+
+    let mut retained = Vec::new();
+
+    for transaction in transactions {
+        if !transaction.committed {
+            summary.removed_incomplete_transactions += 1;
+            continue;
+        }
+
+        if transaction_is_applied(transaction.txid)? {
+            summary.removed_applied_transactions += 1;
+            continue;
+        }
+
+        retained.push(transaction);
+    }
+
+    summary.retained_transactions = retained.len();
+
+    /*
+     * Journal replacement must succeed before applied_tx cleanup.
+     */
+    crate::journal::rewrite_transactions(&retained)?;
+
+    db::clear_applied_transactions().map_err(database_error)?;
+
+    db::checkpoint_metadata_database().map_err(database_error)?;
+
+    Ok(summary)
+}
+
+pub fn print_checkpoint_summary(summary: &CheckpointSummary) {
+    println!("CCFS checkpoint summary");
+    println!("-----------------------");
+    println!(
+        "Original transactions:       {}",
+        summary.original_transactions
+    );
+    println!(
+        "Retained unapplied committed: {}",
+        summary.retained_transactions
+    );
+    println!(
+        "Removed applied:             {}",
+        summary.removed_applied_transactions
+    );
+    println!(
+        "Removed incomplete:          {}",
+        summary.removed_incomplete_transactions
+    );
 }
 
 pub fn inspect_recovery_state() -> io::Result<RecoverySummary> {

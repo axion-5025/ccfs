@@ -93,6 +93,18 @@ fn ensure_journal_parent() -> io::Result<()> {
     Ok(())
 }
 
+fn maybe_enospc(point: &str) -> io::Result<()> {
+    let requested = std::env::var("CCFS_ENOSPC_POINT").ok();
+
+    if requested.as_deref() != Some(point) {
+        return Ok(());
+    }
+
+    eprintln!("CCFS ENOSPC failpoint triggered: {}", point);
+
+    Err(io::Error::from_raw_os_error(28))
+}
+
 fn append_record(record_without_checksum: &str) -> io::Result<()> {
     ensure_journal_parent()?;
 
@@ -104,6 +116,8 @@ fn append_record(record_without_checksum: &str) -> io::Result<()> {
         .create(true)
         .append(true)
         .open(JOURNAL_PATH)?;
+
+    maybe_enospc("journal_write")?;
 
     file.write_all(complete_record.as_bytes())?;
     file.flush()?;
@@ -295,6 +309,77 @@ pub fn journal_exists() -> bool {
 
 pub fn journal_path() -> &'static str {
     JOURNAL_PATH
+}
+
+/*
+ * Atomically rewrite the journal with only the transactions
+ * the caller wants to preserve.
+ *
+ * Durability sequence:
+ *
+ *   1. Write a temporary journal in the same directory.
+ *   2. flush + fsync the temporary file.
+ *   3. Atomically rename it over journal.log.
+ *   4. fsync the parent directory so the rename itself is durable.
+ *
+ * If CCFS crashes before the rename, the old journal remains valid.
+ * If it crashes after the rename, the new journal is already durable.
+ */
+pub fn rewrite_transactions(transactions: &[JournalTransaction]) -> io::Result<()> {
+    ensure_journal_parent()?;
+
+    let journal_path = Path::new(JOURNAL_PATH);
+
+    let parent = journal_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "journal path has no parent directory",
+        )
+    })?;
+
+    let temp_path = parent.join(".journal.log.checkpoint.tmp");
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&temp_path)?;
+
+    for transaction in transactions {
+        let operation_hex = hex_encode(transaction.operation.as_bytes());
+        let payload_hex = hex_encode(&transaction.payload);
+
+        let begin_body = format!(
+            "BEGIN|{}|{}|{}",
+            transaction.txid, operation_hex, payload_hex
+        );
+
+        let begin_checksum = checksum(begin_body.as_bytes());
+
+        writeln!(file, "{}|{:016x}", begin_body, begin_checksum)?;
+
+        if transaction.committed {
+            let commit_body = format!("COMMIT|{}", transaction.txid);
+
+            let commit_checksum = checksum(commit_body.as_bytes());
+
+            writeln!(file, "{}|{:016x}", commit_body, commit_checksum)?;
+        }
+    }
+
+    file.flush()?;
+    file.sync_all()?;
+
+    fs::rename(&temp_path, journal_path)?;
+
+    /*
+     * Persist the directory entry replacement itself.
+     */
+    let directory = File::open(parent)?;
+
+    directory.sync_all()?;
+
+    Ok(())
 }
 
 pub fn clear_journal() -> io::Result<()> {

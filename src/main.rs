@@ -1,6 +1,7 @@
 mod db;
 mod journal;
 mod recovery;
+mod snapshot;
 mod storage;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,11 +28,14 @@ const NAME_MAX: usize = 255;
 const CREATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSCRT1";
 const MKDIR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSMKD1";
 const WRITE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSWRT1";
-const RENAME_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSREN1";
+const RENAME_PAYLOAD_MAGIC_V1: &[u8; 8] = b"CCFSREN1";
+const RENAME_PAYLOAD_MAGIC_V2: &[u8; 8] = b"CCFSREN2";
 const DELETE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSDEL1";
 const RMDIR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSRMD1";
-const TRUNCATE_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSTRN1";
-const SETATTR_PAYLOAD_MAGIC: &[u8; 8] = b"CCFSATR1";
+const TRUNCATE_PAYLOAD_MAGIC_V1: &[u8; 8] = b"CCFSTRN1";
+const TRUNCATE_PAYLOAD_MAGIC_V2: &[u8; 8] = b"CCFSTRN2";
+const SETATTR_PAYLOAD_MAGIC_V1: &[u8; 8] = b"CCFSATR1";
+const SETATTR_PAYLOAD_MAGIC_V2: &[u8; 8] = b"CCFSATR2";
 
 fn validate_name(name: &OsStr) -> Result<(), Errno> {
     let bytes = name.as_bytes();
@@ -54,6 +58,8 @@ struct MemoryEntry {
     is_dir: bool,
     data: Vec<u8>,
     perm: u16,
+    uid: u32,
+    gid: u32,
     atime: SystemTime,
     mtime: SystemTime,
     ctime: SystemTime,
@@ -108,6 +114,8 @@ struct TruncateJournalPayload {
     parent: u64,
     name: String,
     perm: u16,
+    uid: u32,
+    gid: u32,
     atime: i64,
     mtime: i64,
     ctime: i64,
@@ -121,6 +129,8 @@ struct SetattrJournalPayload {
     name: String,
     is_dir: bool,
     perm: u16,
+    uid: u32,
+    gid: u32,
     size: u64,
     atime: i64,
     mtime: i64,
@@ -130,6 +140,7 @@ struct SetattrJournalPayload {
 #[derive(Debug)]
 struct RenameJournalPayload {
     ino: u64,
+    replaced_ino: Option<u64>,
     new_parent: u64,
     new_name: String,
     is_dir: bool,
@@ -576,58 +587,61 @@ fn encode_truncate_payload(payload: &TruncateJournalPayload) -> io::Result<Vec<u
 
     let mut output = Vec::new();
 
-    output.extend_from_slice(TRUNCATE_PAYLOAD_MAGIC);
-
+    output.extend_from_slice(TRUNCATE_PAYLOAD_MAGIC_V2);
     output.extend_from_slice(&payload.ino.to_le_bytes());
-
     output.extend_from_slice(&payload.parent.to_le_bytes());
-
     output.extend_from_slice(&payload.perm.to_le_bytes());
-
+    output.extend_from_slice(&payload.uid.to_le_bytes());
+    output.extend_from_slice(&payload.gid.to_le_bytes());
     output.extend_from_slice(&payload.atime.to_le_bytes());
-
     output.extend_from_slice(&payload.mtime.to_le_bytes());
-
     output.extend_from_slice(&payload.ctime.to_le_bytes());
-
     output.extend_from_slice(&name_length.to_le_bytes());
-
     output.extend_from_slice(&data_length.to_le_bytes());
-
     output.extend_from_slice(name_bytes);
-
     output.extend_from_slice(&payload.data);
 
     Ok(output)
 }
 
 fn decode_truncate_payload(payload: &[u8]) -> io::Result<TruncateJournalPayload> {
-    if payload.len() < TRUNCATE_PAYLOAD_MAGIC.len() {
+    if payload.len() < TRUNCATE_PAYLOAD_MAGIC_V1.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "TRUNCATE payload is too short",
         ));
     }
 
-    if &payload[..TRUNCATE_PAYLOAD_MAGIC.len()] != TRUNCATE_PAYLOAD_MAGIC {
+    let magic = &payload[..TRUNCATE_PAYLOAD_MAGIC_V1.len()];
+
+    let is_v2 = if magic == TRUNCATE_PAYLOAD_MAGIC_V2 {
+        true
+    } else if magic == TRUNCATE_PAYLOAD_MAGIC_V1 {
+        false
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid TRUNCATE payload magic",
         ));
-    }
+    };
 
-    let mut cursor = TRUNCATE_PAYLOAD_MAGIC.len();
+    let mut cursor = TRUNCATE_PAYLOAD_MAGIC_V1.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
 
+    let (uid, gid) = if is_v2 {
+        (
+            u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?),
+            u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?),
+        )
+    } else {
+        (1000, 1000)
+    };
+
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -668,6 +682,8 @@ fn decode_truncate_payload(payload: &[u8]) -> io::Result<TruncateJournalPayload>
         parent,
         name,
         perm,
+        uid,
+        gid,
         atime,
         mtime,
         ctime,
@@ -678,13 +694,15 @@ fn decode_truncate_payload(payload: &[u8]) -> io::Result<TruncateJournalPayload>
 fn apply_truncate_payload(txid: u64, payload: &TruncateJournalPayload) -> io::Result<()> {
     storage::save_file_data(payload.ino, &payload.data)?;
 
-    db::save_entry_metadata_with_times_and_mark_tx(
+    db::save_entry_metadata_with_ownership_and_mark_tx(
         txid,
         payload.ino,
         payload.parent,
         &payload.name,
         false,
         payload.perm,
+        payload.uid,
+        payload.gid,
         payload.data.len() as u64,
         payload.atime,
         payload.mtime,
@@ -708,50 +726,49 @@ fn encode_setattr_payload(payload: &SetattrJournalPayload) -> io::Result<Vec<u8>
 
     let mut output = Vec::new();
 
-    output.extend_from_slice(SETATTR_PAYLOAD_MAGIC);
-
+    output.extend_from_slice(SETATTR_PAYLOAD_MAGIC_V2);
     output.extend_from_slice(&payload.ino.to_le_bytes());
-
     output.extend_from_slice(&payload.parent.to_le_bytes());
 
     output.push(if payload.is_dir { 1 } else { 0 });
 
     output.extend_from_slice(&payload.perm.to_le_bytes());
-
+    output.extend_from_slice(&payload.uid.to_le_bytes());
+    output.extend_from_slice(&payload.gid.to_le_bytes());
     output.extend_from_slice(&payload.size.to_le_bytes());
-
     output.extend_from_slice(&payload.atime.to_le_bytes());
-
     output.extend_from_slice(&payload.mtime.to_le_bytes());
-
     output.extend_from_slice(&payload.ctime.to_le_bytes());
-
     output.extend_from_slice(&name_length.to_le_bytes());
-
     output.extend_from_slice(name_bytes);
 
     Ok(output)
 }
 
 fn decode_setattr_payload(payload: &[u8]) -> io::Result<SetattrJournalPayload> {
-    if payload.len() < SETATTR_PAYLOAD_MAGIC.len() {
+    if payload.len() < SETATTR_PAYLOAD_MAGIC_V1.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "SETATTR payload is too short",
         ));
     }
 
-    if &payload[..SETATTR_PAYLOAD_MAGIC.len()] != SETATTR_PAYLOAD_MAGIC {
+    let magic = &payload[..SETATTR_PAYLOAD_MAGIC_V1.len()];
+
+    let is_v2 = if magic == SETATTR_PAYLOAD_MAGIC_V2 {
+        true
+    } else if magic == SETATTR_PAYLOAD_MAGIC_V1 {
+        false
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid SETATTR payload magic",
         ));
-    }
+    };
 
-    let mut cursor = SETATTR_PAYLOAD_MAGIC.len();
+    let mut cursor = SETATTR_PAYLOAD_MAGIC_V1.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let is_dir = match read_array::<1>(payload, &mut cursor)?[0] {
@@ -768,12 +785,18 @@ fn decode_setattr_payload(payload: &[u8]) -> io::Result<SetattrJournalPayload> {
 
     let perm = u16::from_le_bytes(read_array::<2>(payload, &mut cursor)?);
 
+    let (uid, gid) = if is_v2 {
+        (
+            u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?),
+            u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?),
+        )
+    } else {
+        (1000, 1000)
+    };
+
     let size = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let atime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let mtime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
-
     let ctime = i64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let name_length = u32::from_le_bytes(read_array::<4>(payload, &mut cursor)?) as usize;
@@ -795,6 +818,8 @@ fn decode_setattr_payload(payload: &[u8]) -> io::Result<SetattrJournalPayload> {
         name,
         is_dir,
         perm,
+        uid,
+        gid,
         size,
         atime,
         mtime,
@@ -803,13 +828,15 @@ fn decode_setattr_payload(payload: &[u8]) -> io::Result<SetattrJournalPayload> {
 }
 
 fn apply_setattr_payload(txid: u64, payload: &SetattrJournalPayload) -> io::Result<()> {
-    db::save_entry_metadata_with_times_and_mark_tx(
+    db::save_entry_metadata_with_ownership_and_mark_tx(
         txid,
         payload.ino,
         payload.parent,
         &payload.name,
         payload.is_dir,
         payload.perm,
+        payload.uid,
+        payload.gid,
         payload.size,
         payload.atime,
         payload.mtime,
@@ -831,13 +858,17 @@ fn encode_rename_payload(payload: &RenameJournalPayload) -> io::Result<Vec<u8>> 
     let name_length = u32::try_from(name_bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "RENAME filename too large"))?;
 
+    let replaced_ino = payload.replaced_ino.unwrap_or(u64::MAX);
+
     let mut output = Vec::new();
 
-    output.extend_from_slice(RENAME_PAYLOAD_MAGIC);
+    output.extend_from_slice(RENAME_PAYLOAD_MAGIC_V2);
 
     output.extend_from_slice(&payload.ino.to_le_bytes());
 
     output.extend_from_slice(&payload.new_parent.to_le_bytes());
+
+    output.extend_from_slice(&replaced_ino.to_le_bytes());
 
     output.push(if payload.is_dir { 1 } else { 0 });
 
@@ -859,25 +890,43 @@ fn encode_rename_payload(payload: &RenameJournalPayload) -> io::Result<Vec<u8>> 
 }
 
 fn decode_rename_payload(payload: &[u8]) -> io::Result<RenameJournalPayload> {
-    if payload.len() < RENAME_PAYLOAD_MAGIC.len() {
+    if payload.len() < RENAME_PAYLOAD_MAGIC_V1.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "RENAME payload too short",
         ));
     }
 
-    if &payload[..RENAME_PAYLOAD_MAGIC.len()] != RENAME_PAYLOAD_MAGIC {
+    let magic = &payload[..RENAME_PAYLOAD_MAGIC_V1.len()];
+
+    let is_v2 = if magic == RENAME_PAYLOAD_MAGIC_V2 {
+        true
+    } else if magic == RENAME_PAYLOAD_MAGIC_V1 {
+        false
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid RENAME payload magic",
         ));
-    }
+    };
 
-    let mut cursor = RENAME_PAYLOAD_MAGIC.len();
+    let mut cursor = RENAME_PAYLOAD_MAGIC_V1.len();
 
     let ino = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
 
     let new_parent = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+    /*
+     * V1 journal transactions did not store a replacement inode.
+     * Keeping V1 decoding means old journals remain recoverable.
+     */
+    let replaced_ino = if is_v2 {
+        let value = u64::from_le_bytes(read_array::<8>(payload, &mut cursor)?);
+
+        if value == u64::MAX { None } else { Some(value) }
+    } else {
+        None
+    };
 
     let is_dir = match read_array::<1>(payload, &mut cursor)?[0] {
         0 => false,
@@ -915,6 +964,7 @@ fn decode_rename_payload(payload: &[u8]) -> io::Result<RenameJournalPayload> {
 
     Ok(RenameJournalPayload {
         ino,
+        replaced_ino,
         new_parent,
         new_name,
         is_dir,
@@ -927,9 +977,29 @@ fn decode_rename_payload(payload: &[u8]) -> io::Result<RenameJournalPayload> {
 }
 
 fn apply_rename_payload(txid: u64, payload: &RenameJournalPayload) -> io::Result<()> {
-    db::save_entry_metadata_with_times_and_mark_tx(
+    /*
+     * If POSIX rename replaces an existing destination, remove its
+     * durable block/checksum before metadata commits the replacement.
+     *
+     * This ordering is intentional:
+     *
+     * - Crash before metadata commit:
+     *   recovery sees tx as unapplied and repeats this idempotently.
+     *
+     * - Crash after metadata commit:
+     *   destination storage is already removed and applied_tx was
+     *   committed atomically with the metadata rename.
+     */
+    if let Some(replaced_ino) = payload.replaced_ino {
+        if replaced_ino != payload.ino {
+            storage::delete_file_data(replaced_ino)?;
+        }
+    }
+
+    db::rename_entry_replacing_and_mark_tx(
         txid,
         payload.ino,
+        payload.replaced_ino,
         payload.new_parent,
         &payload.new_name,
         payload.is_dir,
@@ -1094,6 +1164,12 @@ fn run_startup_recovery() -> io::Result<recovery::RecoverySummary> {
             apply_setattr_payload(transaction.txid, &payload)
         }
 
+        "ATIME" => {
+            let payload = decode_setattr_payload(&transaction.payload)?;
+
+            apply_setattr_payload(transaction.txid, &payload)
+        }
+
         "RENAME" => {
             let payload = decode_rename_payload(&transaction.payload)?;
 
@@ -1144,6 +1220,10 @@ impl Ccfs {
                 data: b"Hello from CCFS!\n".to_vec(),
 
                 perm: 0o644,
+
+                uid: 1000,
+
+                gid: 1000,
 
                 atime: now,
 
@@ -1215,6 +1295,10 @@ impl Ccfs {
                             data,
 
                             perm: meta.perm,
+
+                            uid: meta.uid,
+
+                            gid: meta.gid,
 
                             atime: timestamp_to_system_time(meta.atime),
 
@@ -1307,9 +1391,9 @@ fn entry_attr(entry: &MemoryEntry) -> FileAttr {
 
         nlink: if entry.is_dir { 2 } else { 1 },
 
-        uid: 1000,
+        uid: entry.uid,
 
-        gid: 1000,
+        gid: entry.gid,
 
         rdev: 0,
 
@@ -1616,6 +1700,19 @@ fn show_recovery_status() {
     }
 }
 
+fn run_checkpoint() {
+    let summary = match recovery::checkpoint_recovery_state() {
+        Ok(summary) => summary,
+
+        Err(err) => {
+            eprintln!("CCFS checkpoint failed: {}", err);
+            process::exit(1);
+        }
+    };
+
+    recovery::print_checkpoint_summary(&summary);
+}
+
 fn print_usage() {
     println!("CCFS");
     println!();
@@ -1624,8 +1721,14 @@ fn print_usage() {
     println!("  ccfs --migrate-checksums");
     println!("  ccfs --check-integrity");
     println!("  ccfs --recovery-status");
+    println!("  ccfs --checkpoint");
+    println!("  ccfs --snapshot-create <name>");
+    println!("  ccfs --snapshot-list");
+    println!("  ccfs --snapshot-read <name> <path>");
+    println!("  ccfs --snapshot-verify <name>");
+    println!("  ccfs --snapshot-restore <name>");
+    println!("  ccfs --snapshot-delete <name>");
 }
-
 /* ============================================================
  * FILESYSTEM
  * ============================================================
@@ -1649,13 +1752,11 @@ impl Filesystem for Ccfs {
 
         let Some(ino) = find_child(&state, parent, name.as_ref()) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         let Some(entry) = state.entries.get(&ino) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
@@ -1665,7 +1766,6 @@ impl Filesystem for Ccfs {
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         if ino == INodeNo::ROOT {
             reply.attr(&TTL, &root_attr());
-
             return;
         }
 
@@ -1673,7 +1773,6 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
@@ -1685,8 +1784,8 @@ impl Filesystem for Ccfs {
         _req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
@@ -1700,7 +1799,6 @@ impl Filesystem for Ccfs {
     ) {
         if ino == INodeNo::ROOT {
             reply.attr(&TTL, &root_attr());
-
             return;
         }
 
@@ -1708,38 +1806,43 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         let mut new_perm = entry.perm;
-
+        let mut new_uid = entry.uid;
+        let mut new_gid = entry.gid;
         let mut new_atime = entry.atime;
-
         let mut new_mtime = entry.mtime;
-
         let mut new_ctime = entry.ctime;
-
         let mut final_data = entry.data.clone();
 
         let mut changed = false;
-
         let mut change_ctime = false;
 
         let size_requested = size.is_some();
 
         if let Some(mode) = mode {
             new_perm = (mode & 0o777) as u16;
-
             changed = true;
+            change_ctime = true;
+        }
 
+        if let Some(value) = uid {
+            new_uid = value;
+            changed = true;
+            change_ctime = true;
+        }
+
+        if let Some(value) = gid {
+            new_gid = value;
+            changed = true;
             change_ctime = true;
         }
 
         if let Some(new_size) = size {
             if entry.is_dir {
                 reply.error(Errno::EISDIR);
-
                 return;
             }
 
@@ -1748,7 +1851,6 @@ impl Filesystem for Ccfs {
 
                 Err(_) => {
                     reply.error(Errno::EFBIG);
-
                     return;
                 }
             };
@@ -1758,21 +1860,17 @@ impl Filesystem for Ccfs {
             new_mtime = SystemTime::now();
 
             changed = true;
-
             change_ctime = true;
         }
 
         if let Some(value) = atime {
             new_atime = resolve_time(value);
-
             changed = true;
         }
 
         if let Some(value) = mtime {
             new_mtime = resolve_time(value);
-
             changed = true;
-
             change_ctime = true;
         }
 
@@ -1780,7 +1878,6 @@ impl Filesystem for Ccfs {
 
         if let Some(value) = ctime {
             new_ctime = value;
-
             changed = true;
         }
 
@@ -1791,19 +1888,14 @@ impl Filesystem for Ccfs {
         if size_requested {
             let payload = TruncateJournalPayload {
                 ino: u64::from(entry.ino),
-
                 parent: u64::from(entry.parent),
-
                 name: entry.name.clone(),
-
                 perm: new_perm,
-
+                uid: new_uid,
+                gid: new_gid,
                 atime: system_time_to_timestamp(new_atime),
-
                 mtime: system_time_to_timestamp(new_mtime),
-
                 ctime: system_time_to_timestamp(new_ctime),
-
                 data: final_data.clone(),
             };
 
@@ -1812,9 +1904,7 @@ impl Filesystem for Ccfs {
 
                 Err(err) => {
                     eprintln!("Failed TRUNCATE payload encode: {}", err);
-
                     reply.error(Errno::EIO);
-
                     return;
                 }
             };
@@ -1824,9 +1914,7 @@ impl Filesystem for Ccfs {
 
                 Err(err) => {
                     eprintln!("Failed TRUNCATE BEGIN: {}", err);
-
                     reply.error(Errno::EIO);
-
                     return;
                 }
             };
@@ -1835,9 +1923,7 @@ impl Filesystem for Ccfs {
 
             if let Err(err) = journal::commit_transaction(txid) {
                 eprintln!("Failed TRUNCATE COMMIT: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
 
@@ -1845,49 +1931,38 @@ impl Filesystem for Ccfs {
 
             if let Err(err) = apply_truncate_payload(txid, &payload) {
                 eprintln!("Committed TRUNCATE {} apply failed: {}", txid, err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
 
             entry.data = final_data;
-
             entry.perm = new_perm;
-
+            entry.uid = new_uid;
+            entry.gid = new_gid;
             entry.atime = new_atime;
-
             entry.mtime = new_mtime;
-
             entry.ctime = new_ctime;
 
             reply.attr(&TTL, &entry_attr(entry));
-
             return;
         }
 
         if changed {
             let payload = SetattrJournalPayload {
                 ino: u64::from(entry.ino),
-
                 parent: u64::from(entry.parent),
-
                 name: entry.name.clone(),
-
                 is_dir: entry.is_dir,
-
                 perm: new_perm,
-
+                uid: new_uid,
+                gid: new_gid,
                 size: if entry.is_dir {
                     0
                 } else {
                     entry.data.len() as u64
                 },
-
                 atime: system_time_to_timestamp(new_atime),
-
                 mtime: system_time_to_timestamp(new_mtime),
-
                 ctime: system_time_to_timestamp(new_ctime),
             };
 
@@ -1896,9 +1971,7 @@ impl Filesystem for Ccfs {
 
                 Err(err) => {
                     eprintln!("Failed SETATTR payload encode: {}", err);
-
                     reply.error(Errno::EIO);
-
                     return;
                 }
             };
@@ -1908,9 +1981,7 @@ impl Filesystem for Ccfs {
 
                 Err(err) => {
                     eprintln!("Failed SETATTR BEGIN: {}", err);
-
                     reply.error(Errno::EIO);
-
                     return;
                 }
             };
@@ -1919,9 +1990,7 @@ impl Filesystem for Ccfs {
 
             if let Err(err) = journal::commit_transaction(txid) {
                 eprintln!("Failed SETATTR COMMIT: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
 
@@ -1929,18 +1998,15 @@ impl Filesystem for Ccfs {
 
             if let Err(err) = apply_setattr_payload(txid, &payload) {
                 eprintln!("Committed SETATTR {} apply failed: {}", txid, err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
 
             entry.perm = new_perm;
-
+            entry.uid = new_uid;
+            entry.gid = new_gid;
             entry.atime = new_atime;
-
             entry.mtime = new_mtime;
-
             entry.ctime = new_ctime;
         }
 
@@ -2023,33 +2089,25 @@ impl Filesystem for Ccfs {
 
         if find_child(&state, parent, &name).is_some() {
             reply.error(Errno::EEXIST);
-
             return;
         }
 
         let ino_value = state.next_ino;
-
         state.next_ino += 1;
 
         let now = SystemTime::now();
 
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
-
             parent,
-
             name: name.clone(),
-
             is_dir: true,
-
             data: Vec::new(),
-
             perm: (mode & !umask & 0o777) as u16,
-
+            uid: 1000,
+            gid: 1000,
             atime: now,
-
             mtime: now,
-
             ctime: now,
         };
 
@@ -2057,17 +2115,11 @@ impl Filesystem for Ccfs {
 
         let payload = MkdirJournalPayload {
             ino: ino_value,
-
             parent: u64::from(parent),
-
             name: name.clone(),
-
             perm: entry.perm,
-
             atime: system_time_to_timestamp(entry.atime),
-
             mtime: system_time_to_timestamp(entry.mtime),
-
             ctime: system_time_to_timestamp(entry.ctime),
         };
 
@@ -2078,9 +2130,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed MKDIR BEGIN: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2089,9 +2139,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed MKDIR COMMIT: {}", err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2099,9 +2147,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = apply_mkdir_payload(txid, &payload) {
             eprintln!("Committed MKDIR {} apply failed: {}", txid, err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2136,33 +2182,25 @@ impl Filesystem for Ccfs {
 
         if find_child(&state, parent, &name).is_some() {
             reply.error(Errno::EEXIST);
-
             return;
         }
 
         let ino_value = state.next_ino;
-
         state.next_ino += 1;
 
         let now = SystemTime::now();
 
         let entry = MemoryEntry {
             ino: INodeNo(ino_value),
-
             parent,
-
             name: name.clone(),
-
             is_dir: false,
-
             data: Vec::new(),
-
             perm: (mode & !umask & 0o777) as u16,
-
+            uid: 1000,
+            gid: 1000,
             atime: now,
-
             mtime: now,
-
             ctime: now,
         };
 
@@ -2175,9 +2213,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed CREATE BEGIN: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2186,9 +2222,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed CREATE COMMIT: {}", err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2196,25 +2230,17 @@ impl Filesystem for Ccfs {
 
         let payload = CreateJournalPayload {
             ino: ino_value,
-
             parent: u64::from(parent),
-
             name: name.clone(),
-
             perm: entry.perm,
-
             atime: system_time_to_timestamp(entry.atime),
-
             mtime: system_time_to_timestamp(entry.mtime),
-
             ctime: system_time_to_timestamp(entry.ctime),
         };
 
         if let Err(err) = apply_create_payload(txid, &payload) {
             eprintln!("Committed CREATE {} apply failed: {}", txid, err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2246,30 +2272,25 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &name) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         if ino_value == 2 {
             reply.error(Errno::EPERM);
-
             return;
         }
 
         let Some(entry) = state.entries.get(&ino_value) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
-
             return;
         }
 
         let delete_payload = DeleteJournalPayload { ino: ino_value };
-
         let encoded_payload = encode_delete_payload(&delete_payload);
 
         let txid = match journal::begin_transaction("DELETE", &encoded_payload) {
@@ -2277,9 +2298,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed DELETE BEGIN: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2288,9 +2307,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed DELETE COMMIT: {}", err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2298,9 +2315,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = apply_delete_payload(txid, &delete_payload) {
             eprintln!("Committed DELETE {} apply failed: {}", txid, err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2326,19 +2341,16 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &name) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         let Some(entry) = state.entries.get(&ino_value) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         if !entry.is_dir {
             reply.error(Errno::ENOTDIR);
-
             return;
         }
 
@@ -2350,12 +2362,10 @@ impl Filesystem for Ccfs {
             .any(|child| child.parent == directory_ino)
         {
             reply.error(Errno::ENOTEMPTY);
-
             return;
         }
 
         let payload = RmdirJournalPayload { ino: ino_value };
-
         let encoded_payload = encode_rmdir_payload(&payload);
 
         let txid = match journal::begin_transaction("RMDIR", &encoded_payload) {
@@ -2363,9 +2373,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed RMDIR BEGIN: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2374,9 +2382,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed RMDIR COMMIT: {}", err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2384,9 +2390,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = apply_rmdir_payload(txid, &payload) {
             eprintln!("Committed RMDIR {} apply failed: {}", txid, err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2415,14 +2419,19 @@ impl Filesystem for Ccfs {
             return;
         }
 
+        /*
+         * This project currently implements normal POSIX rename()
+         * replacement semantics for the no-flags case.
+         *
+         * RENAME_NOREPLACE / RENAME_EXCHANGE / RENAME_WHITEOUT
+         * are intentionally not implemented yet.
+         */
         if !flags.is_empty() {
             reply.error(Errno::EINVAL);
-
             return;
         }
 
         let old_name = name.to_string_lossy().into_owned();
-
         let new_name = newname.to_string_lossy().into_owned();
 
         let mut state = self.state.lock().unwrap();
@@ -2439,13 +2448,15 @@ impl Filesystem for Ccfs {
 
         let Some(ino_value) = find_child(&state, parent, &old_name) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
+        /*
+         * hello.txt is CCFS's built-in non-persistent inode.
+         * Keep it protected from rename/replacement operations.
+         */
         if ino_value == 2 {
             reply.error(Errno::EPERM);
-
             return;
         }
 
@@ -2454,21 +2465,87 @@ impl Filesystem for Ccfs {
             return;
         }
 
-        if find_child(&state, newparent, &new_name).is_some() {
-            reply.error(Errno::EEXIST);
+        let (source_is_dir, source_perm, source_size, source_atime, source_mtime) = {
+            let Some(source) = state.entries.get(&ino_value) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
 
-            return;
-        }
-
-        let Some(current_entry) = state.entries.get(&ino_value) else {
-            reply.error(Errno::ENOENT);
-
-            return;
+            (
+                source.is_dir,
+                source.perm,
+                if source.is_dir {
+                    0
+                } else {
+                    source.data.len() as u64
+                },
+                source.atime,
+                source.mtime,
+            )
         };
 
-        if current_entry.is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
-            reply.error(Errno::EINVAL);
+        /*
+         * POSIX rename allows the destination to already exist.
+         *
+         * Compatible destinations are replaced:
+         *   file -> file
+         *   directory -> empty directory
+         *
+         * Incompatible type replacement must fail.
+         */
+        let replaced_ino = find_child(&state, newparent, &new_name);
 
+        if let Some(destination_ino) = replaced_ino {
+            if destination_ino == ino_value {
+                reply.ok();
+                return;
+            }
+
+            if destination_ino == 2 {
+                reply.error(Errno::EPERM);
+                return;
+            }
+
+            let (destination_is_dir, destination_entry_ino) = {
+                let Some(destination) = state.entries.get(&destination_ino) else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+
+                (destination.is_dir, destination.ino)
+            };
+
+            if source_is_dir && !destination_is_dir {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+
+            if !source_is_dir && destination_is_dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+
+            /*
+             * A directory may replace only an empty directory.
+             */
+            if source_is_dir
+                && destination_is_dir
+                && state
+                    .entries
+                    .values()
+                    .any(|child| child.parent == destination_entry_ino)
+            {
+                reply.error(Errno::ENOTEMPTY);
+                return;
+            }
+        }
+
+        /*
+         * A directory may never be moved into itself or one of
+         * its descendants.
+         */
+        if source_is_dir && would_create_directory_cycle(&state, ino_value, newparent) {
+            reply.error(Errno::EINVAL);
             return;
         }
 
@@ -2476,25 +2553,14 @@ impl Filesystem for Ccfs {
 
         let rename_payload = RenameJournalPayload {
             ino: ino_value,
-
+            replaced_ino,
             new_parent: u64::from(newparent),
-
             new_name: new_name.clone(),
-
-            is_dir: current_entry.is_dir,
-
-            perm: current_entry.perm,
-
-            size: if current_entry.is_dir {
-                0
-            } else {
-                current_entry.data.len() as u64
-            },
-
-            atime: system_time_to_timestamp(current_entry.atime),
-
-            mtime: system_time_to_timestamp(current_entry.mtime),
-
+            is_dir: source_is_dir,
+            perm: source_perm,
+            size: source_size,
+            atime: system_time_to_timestamp(source_atime),
+            mtime: system_time_to_timestamp(source_mtime),
             ctime: system_time_to_timestamp(now),
         };
 
@@ -2503,9 +2569,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed to encode RENAME payload: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2515,9 +2579,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed RENAME BEGIN: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2526,9 +2588,7 @@ impl Filesystem for Ccfs {
 
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed RENAME COMMIT: {}", err);
-
             reply.error(Errno::EIO);
-
             return;
         }
 
@@ -2538,20 +2598,26 @@ impl Filesystem for Ccfs {
             eprintln!("Committed RENAME {} apply failed: {}", txid, err);
 
             reply.error(Errno::EIO);
-
             return;
+        }
+
+        /*
+         * Durable metadata/storage apply succeeded.
+         * Now mirror the same result in memory.
+         */
+        if let Some(destination_ino) = replaced_ino {
+            if destination_ino != ino_value {
+                state.entries.remove(&destination_ino);
+            }
         }
 
         let Some(entry) = state.entries.get_mut(&ino_value) else {
             reply.error(Errno::EIO);
-
             return;
         };
 
         entry.parent = newparent;
-
         entry.name = new_name;
-
         entry.ctime = now;
 
         reply.ok();
@@ -2572,35 +2638,85 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
-
             return;
         }
 
-        entry.atime = SystemTime::now();
+        let new_atime = SystemTime::now();
 
-        if let Err(err) = persist_entry(entry) {
-            eprintln!("Failed access-time persistence: {}", err);
+        let payload = SetattrJournalPayload {
+            ino: u64::from(entry.ino),
+            parent: u64::from(entry.parent),
+            name: entry.name.clone(),
+            is_dir: entry.is_dir,
+            perm: entry.perm,
+            uid: entry.uid,
+            gid: entry.gid,
+            size: entry.data.len() as u64,
+            atime: system_time_to_timestamp(new_atime),
+            mtime: system_time_to_timestamp(entry.mtime),
+            ctime: system_time_to_timestamp(entry.ctime),
+        };
 
+        let encoded_payload = match encode_setattr_payload(&payload) {
+            Ok(encoded) => encoded,
+
+            Err(err) => {
+                eprintln!("Failed ATIME payload encode: {}", err);
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        let txid = match journal::begin_transaction("ATIME", &encoded_payload) {
+            Ok(txid) => txid,
+
+            Err(err) => {
+                eprintln!("Failed ATIME BEGIN: {}", err);
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        maybe_kill9("ATIME", "after_begin");
+
+        if let Err(err) = journal::commit_transaction(txid) {
+            eprintln!("Failed ATIME COMMIT: {}", err);
             reply.error(Errno::EIO);
-
             return;
         }
 
-        let start = offset as usize;
+        maybe_kill9("ATIME", "after_commit");
+
+        if let Err(err) = apply_setattr_payload(txid, &payload) {
+            eprintln!("Committed ATIME {} apply failed: {}", txid, err);
+            reply.error(Errno::EIO);
+            return;
+        }
+
+        entry.atime = new_atime;
+
+        let start = match usize::try_from(offset) {
+            Ok(value) => value,
+
+            Err(_) => {
+                reply.error(Errno::EFBIG);
+                return;
+            }
+        };
 
         if start >= entry.data.len() {
             reply.data(&[]);
-
             return;
         }
 
-        let end = (start + size as usize).min(entry.data.len());
+        let size = size as usize;
+
+        let end = start.saturating_add(size).min(entry.data.len());
 
         reply.data(&entry.data[start..end]);
     }
@@ -2621,13 +2737,11 @@ impl Filesystem for Ccfs {
 
         let Some(entry) = state.entries.get_mut(&u64::from(ino)) else {
             reply.error(Errno::ENOENT);
-
             return;
         };
 
         if entry.is_dir {
             reply.error(Errno::EISDIR);
-
             return;
         }
 
@@ -2636,7 +2750,6 @@ impl Filesystem for Ccfs {
 
             Err(_) => {
                 reply.error(Errno::EFBIG);
-
                 return;
             }
         };
@@ -2646,7 +2759,6 @@ impl Filesystem for Ccfs {
 
             None => {
                 reply.error(Errno::EFBIG);
-
                 return;
             }
         };
@@ -2667,19 +2779,12 @@ impl Filesystem for Ccfs {
 
         let payload = WriteJournalPayload {
             ino: u64::from(entry.ino),
-
             parent: u64::from(entry.parent),
-
             name: entry.name.clone(),
-
             perm: entry.perm,
-
             atime: system_time_to_timestamp(entry.atime),
-
             mtime: system_time_to_timestamp(now),
-
             ctime: system_time_to_timestamp(now),
-
             data: final_data.clone(),
         };
 
@@ -2688,9 +2793,7 @@ impl Filesystem for Ccfs {
 
             Err(err) => {
                 eprintln!("Failed WRITE payload encode: {}", err);
-
                 reply.error(Errno::EIO);
-
                 return;
             }
         };
@@ -2701,8 +2804,11 @@ impl Filesystem for Ccfs {
             Err(err) => {
                 eprintln!("Failed WRITE BEGIN: {}", err);
 
-                reply.error(Errno::EIO);
-
+                if err.raw_os_error() == Some(28) {
+                    reply.error(Errno::ENOSPC);
+                } else {
+                    reply.error(Errno::EIO);
+                }
                 return;
             }
         };
@@ -2712,8 +2818,11 @@ impl Filesystem for Ccfs {
         if let Err(err) = journal::commit_transaction(txid) {
             eprintln!("Failed WRITE COMMIT: {}", err);
 
-            reply.error(Errno::EIO);
-
+            if err.raw_os_error() == Some(28) {
+                reply.error(Errno::ENOSPC);
+            } else {
+                reply.error(Errno::EIO);
+            }
             return;
         }
 
@@ -2722,15 +2831,16 @@ impl Filesystem for Ccfs {
         if let Err(err) = apply_write_payload(txid, &payload) {
             eprintln!("Committed WRITE {} apply failed: {}", txid, err);
 
-            reply.error(Errno::EIO);
-
+            if err.raw_os_error() == Some(28) {
+                reply.error(Errno::ENOSPC);
+            } else {
+                reply.error(Errno::EIO);
+            }
             return;
         }
 
         entry.data = final_data;
-
         entry.mtime = now;
-
         entry.ctime = now;
 
         reply.written(data.len() as u32);
@@ -2739,22 +2849,90 @@ impl Filesystem for Ccfs {
     fn flush(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        {
+            let state = self.state.lock().unwrap();
+
+            let Some(entry) = state.entries.get(&u64::from(ino)) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+
+            if entry.is_dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+
+            /*
+             * inode 2 is the built-in hello.txt entry.
+             * It does not have a persistent block on disk.
+             */
+            if u64::from(ino) == 2 {
+                reply.ok();
+                return;
+            }
+        }
+
+        if let Err(err) = storage::sync_file_data(u64::from(ino), false) {
+            eprintln!(
+                "Failed FLUSH durability sync for inode {}: {}",
+                u64::from(ino),
+                err
+            );
+
+            reply.error(Errno::EIO);
+            return;
+        }
+
         reply.ok();
     }
 
     fn fsync(
         &self,
         _req: &Request,
-        _ino: INodeNo,
+        ino: INodeNo,
         _fh: FileHandle,
-        _datasync: bool,
+        datasync: bool,
         reply: ReplyEmpty,
     ) {
+        {
+            let state = self.state.lock().unwrap();
+
+            let Some(entry) = state.entries.get(&u64::from(ino)) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+
+            if entry.is_dir {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+
+            /*
+             * inode 2 is the built-in hello.txt entry.
+             * It does not have a persistent block on disk.
+             */
+            if u64::from(ino) == 2 {
+                reply.ok();
+                return;
+            }
+        }
+
+        if let Err(err) = storage::sync_file_data(u64::from(ino), datasync) {
+            eprintln!(
+                "Failed FSYNC durability sync for inode {}: {}",
+                u64::from(ino),
+                err
+            );
+
+            reply.error(Errno::EIO);
+            return;
+        }
+
         reply.ok();
     }
 }
@@ -2781,6 +2959,155 @@ fn main() {
 
             "--recovery-status" => {
                 show_recovery_status();
+                return;
+            }
+
+            "--checkpoint" => {
+                run_checkpoint();
+                return;
+            }
+
+            "--snapshot-create" => {
+                if args.len() != 3 {
+                    eprintln!("Usage: ccfs --snapshot-create <name>");
+                    process::exit(2);
+                }
+
+                match snapshot::create_snapshot(&args[2]) {
+                    Ok(summary) => {
+                        println!("Snapshot created: {}", summary.name);
+                        println!("Files captured: {}", summary.files);
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot creation failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
+                return;
+            }
+
+            "--snapshot-list" => {
+                if args.len() != 2 {
+                    eprintln!("Usage: ccfs --snapshot-list");
+                    process::exit(2);
+                }
+
+                match snapshot::list_snapshots() {
+                    Ok(snapshots) => {
+                        println!("CCFS snapshots");
+                        println!("--------------");
+
+                        if snapshots.is_empty() {
+                            println!("No snapshots.");
+                        } else {
+                            for name in snapshots {
+                                println!("{}", name);
+                            }
+                        }
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot listing failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
+                return;
+            }
+
+            "--snapshot-read" => {
+                if args.len() != 4 {
+                    eprintln!("Usage: ccfs --snapshot-read <name> <path>");
+                    process::exit(2);
+                }
+
+                match snapshot::read_snapshot_file(&args[2], &args[3]) {
+                    Ok(data) => {
+                        let mut stdout = std::io::stdout();
+
+                        if let Err(err) = std::io::Write::write_all(&mut stdout, &data) {
+                            eprintln!("Snapshot read output failed: {}", err);
+                            process::exit(1);
+                        }
+
+                        if let Err(err) = std::io::Write::flush(&mut stdout) {
+                            eprintln!("Snapshot read flush failed: {}", err);
+                            process::exit(1);
+                        }
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot read failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
+                return;
+            }
+
+            "--snapshot-verify" => {
+                if args.len() != 3 {
+                    eprintln!("Usage: ccfs --snapshot-verify <name>");
+                    process::exit(2);
+                }
+
+                match snapshot::verify_snapshot(&args[2]) {
+                    Ok(summary) => {
+                        println!("Snapshot verified: {}", summary.name);
+
+                        println!("Files checked: {}", summary.files_checked);
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot verification failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
+                return;
+            }
+
+            "--snapshot-restore" => {
+                if args.len() != 3 {
+                    eprintln!("Usage: ccfs --snapshot-restore <name>");
+                    process::exit(2);
+                }
+
+                match snapshot::restore_snapshot(&args[2]) {
+                    Ok(summary) => {
+                        println!("Snapshot restored: {}", summary.name);
+
+                        println!("Files restored: {}", summary.files_restored);
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot restore failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
+                return;
+            }
+
+            "--snapshot-delete" => {
+                if args.len() != 3 {
+                    eprintln!("Usage: ccfs --snapshot-delete <name>");
+                    process::exit(2);
+                }
+
+                match snapshot::delete_snapshot(&args[2]) {
+                    Ok(()) => {
+                        println!("Snapshot deleted: {}", args[2]);
+                    }
+
+                    Err(err) => {
+                        eprintln!("Snapshot deletion failed: {}", err);
+                        process::exit(1);
+                    }
+                }
+
                 return;
             }
 
